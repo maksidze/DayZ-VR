@@ -1,6 +1,6 @@
 # DayZ OpenXR VR Mod
 
-An experimental, unofficial VR prototype for the Windows x64 version of DayZ. It presents DayZ through an OpenXR runtime and modifies selected rendering, camera, GUI, and mouse-input behavior inside the running game.
+An experimental, unofficial VR prototype for the Windows x64 version of DayZ. It presents DayZ through an OpenXR runtime and modifies selected rendering, camera, GUI, and mouse-input behavior inside the running game. The proxy currently recognizes the matching retail `DayZ_x64.exe` and diagnostic `DayZDiag_x64.exe` builds.
 
 > [!WARNING]
 > This mod is **not compatible with anti-cheat software**. It loads a local `dxgi.dll` proxy and installs hooks in the game process, behavior that anti-cheat systems can detect or block. Do not use it on BattlEye-protected or other anti-cheat-enabled servers. Use it only in a private, offline, or otherwise explicitly permitted environment. You assume all risk, including crashes, account restrictions, or bans.
@@ -10,6 +10,15 @@ An experimental, unofficial VR prototype for the Windows x64 version of DayZ. It
 The mod is loaded as a local DXGI proxy placed next to `DayZ_x64.exe`. The proxy forwards the normal DXGI factory exports to the Windows system library, intercepts swap-chain creation and presentation, and passes rendered frames to an OpenXR session through Direct3D 11.
 
 The runtime component contains build-specific DayZ hooks used to observe and adjust the camera/render pipeline, alternate eye state, apply HMD rotation, remap GUI coordinates, and composite the interface for VR. Because these hooks rely on executable offsets, a DayZ update may make the mod stop working until the offsets are updated.
+
+The supported executable identities are checked before any game hook is installed:
+
+```text
+DayZ_x64.exe      PE timestamp 0x6A47B9AA, SizeOfImage 0x04407000
+DayZDiag_x64.exe  PE timestamp 0x6A47BAF9, SizeOfImage 0x049E7000
+```
+
+Support for `DayZDiag_x64.exe` is based on static signature relocation and should be treated as runtime-experimental until its startup log confirms that the diagnostic profile and all render signatures were accepted.
 
 The system cursor is deliberately locked to the center of the game window while GUI cursor mode is active. Mouse movement updates a separate virtual cursor in DayZ's GUI coordinate space. This custom cursor remains aligned when the GUI is resized and is drawn into the VR-visible interface layer; the normal desktop cursor is therefore not used for interaction.
 

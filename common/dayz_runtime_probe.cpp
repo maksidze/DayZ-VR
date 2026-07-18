@@ -23,16 +23,40 @@
 
 namespace
 {
-    constexpr std::uint32_t kPeTimestamp = 0x6A47B9AAu;
-    constexpr std::uint32_t kImageSize = 0x04407000u;
-    constexpr std::uintptr_t kPrepareViewRva = 0x004501A0;
-    constexpr std::uintptr_t kExecuteViewRva = 0x004513A0;
-    constexpr std::uintptr_t kFinalizeViewRva = 0x004514B0;
-    constexpr std::uintptr_t kProjectionDispatchRva = 0x00952B30;
-    constexpr std::uintptr_t kHudLayoutRva = 0x008A2DB0;
-    constexpr std::uintptr_t kGuiInputMessageRva = 0x00351760;
-    constexpr std::uintptr_t kGuiScaleRva = 0x0427063C;
-    constexpr std::uintptr_t kEngineSingletonRva = 0x04263740;
+    struct BuildProfile
+    {
+        const char* name;
+        std::uint32_t peTimestamp;
+        std::uint32_t imageSize;
+        std::uintptr_t prepareViewRva;
+        std::uintptr_t executeViewRva;
+        std::uintptr_t finalizeViewRva;
+        std::uintptr_t projectionDispatchRva;
+        std::uintptr_t hudLayoutRva;
+        std::uintptr_t guiInputMessageRva;
+        std::uintptr_t guiScaleRva;
+        std::uintptr_t engineSingletonRva;
+    };
+
+    constexpr std::array kBuildProfiles{
+        BuildProfile{"DayZ_x64", 0x6A47B9AAu, 0x04407000u, 0x004501A0, 0x004513A0,
+            0x004514B0, 0x00952B30, 0x008A2DB0, 0x00351760, 0x0427063C,
+            0x04263740},
+        BuildProfile{"DayZDiag_x64", 0x6A47BAF9u, 0x049E7000u, 0x0048D8A0, 0x0048EB30,
+            0x0048EC40, 0x00B30D10, 0x00A7B7B0, 0x00389410, 0x04823F4C,
+            0x04815740},
+    };
+
+    const BuildProfile* g_buildProfile{};
+    std::uint32_t kImageSize{};
+    std::uintptr_t kPrepareViewRva{};
+    std::uintptr_t kExecuteViewRva{};
+    std::uintptr_t kFinalizeViewRva{};
+    std::uintptr_t kProjectionDispatchRva{};
+    std::uintptr_t kHudLayoutRva{};
+    std::uintptr_t kGuiInputMessageRva{};
+    std::uintptr_t kGuiScaleRva{};
+    std::uintptr_t kEngineSingletonRva{};
     constexpr std::ptrdiff_t kContextCamera = 0x118;
     constexpr std::ptrdiff_t kPreparedContextCamera = 0xA34;
     constexpr std::ptrdiff_t kContextDescriptor = 0xA10;
@@ -161,6 +185,7 @@ namespace
     float g_hudSafeHeight{};
     float g_hudCompositeWidth{};
     float g_hudCompositeHeight{};
+    float g_hudContentScale{1.0f};
     float g_hudLeftOffsetX{};
     float g_hudRightOffsetX{};
     std::atomic_bool g_hudSafeLogged{};
@@ -184,6 +209,7 @@ namespace
     std::atomic_bool g_hudLayerDirty{};
     std::atomic_bool g_hudLayerNeedsClear{true};
     std::atomic_bool g_hudLayerLogged{};
+    std::atomic_bool g_inventoryLayerLogged{};
     bool g_guiMouseRemapEnabled{true};
     bool g_guiCursorEnabled{true};
     HWND g_gameWindow{};
@@ -205,8 +231,9 @@ namespace
     {
         float cursorUv[2];
         float cursorPixelUv[2];
+        float contentScale;
         float cursorVisible;
-        float padding[3];
+        float padding[2];
     };
 
     constexpr char kHudCompositeShader[] = R"(
@@ -216,8 +243,9 @@ cbuffer HudConstants : register(b0)
 {
     float2 CursorUv;
     float2 CursorPixelUv;
+    float ContentScale;
     float CursorVisible;
-    float3 Padding;
+    float2 Padding;
 };
 struct VertexOutput { float4 position : SV_Position; float2 uv : TEXCOORD0; };
 VertexOutput VSMain(uint id : SV_VertexID)
@@ -229,8 +257,10 @@ VertexOutput VSMain(uint id : SV_VertexID)
 }
 float4 PSMain(VertexOutput input) : SV_Target
 {
-    float4 color = HudLayer.Sample(LinearClamp, input.uv);
-    float2 cursorPixel = (input.uv - CursorUv) / CursorPixelUv;
+    float2 sourceUv = (input.uv - 0.5) / ContentScale + 0.5;
+    if (any(sourceUv < 0.0) || any(sourceUv > 1.0)) discard;
+    float4 color = HudLayer.Sample(LinearClamp, sourceUv);
+    float2 cursorPixel = (sourceUv - CursorUv) / CursorPixelUv;
     bool cursorBody = CursorVisible > 0.5 && cursorPixel.x >= 0.0 && cursorPixel.y >= 0.0 &&
         cursorPixel.y < 25.0 && cursorPixel.x <= cursorPixel.y * 0.68;
     bool cursorStem = CursorVisible > 0.5 && cursorPixel.x >= 6.0 && cursorPixel.x < 10.0 &&
@@ -439,9 +469,28 @@ float4 PSMain(VertexOutput input) : SV_Target
         if (dos->e_magic != IMAGE_DOS_SIGNATURE)
             return false;
         const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(g_moduleBase + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.TimeDateStamp != kPeTimestamp ||
-            nt->OptionalHeader.SizeOfImage != kImageSize)
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
             return false;
+
+        for (const BuildProfile& profile : kBuildProfiles)
+            if (nt->FileHeader.TimeDateStamp == profile.peTimestamp &&
+                nt->OptionalHeader.SizeOfImage == profile.imageSize)
+            {
+                g_buildProfile = &profile;
+                break;
+            }
+        if (!g_buildProfile)
+            return false;
+
+        kPrepareViewRva = g_buildProfile->prepareViewRva;
+        kImageSize = g_buildProfile->imageSize;
+        kExecuteViewRva = g_buildProfile->executeViewRva;
+        kFinalizeViewRva = g_buildProfile->finalizeViewRva;
+        kProjectionDispatchRva = g_buildProfile->projectionDispatchRva;
+        kHudLayoutRva = g_buildProfile->hudLayoutRva;
+        kGuiInputMessageRva = g_buildProfile->guiInputMessageRva;
+        kGuiScaleRva = g_buildProfile->guiScaleRva;
+        kEngineSingletonRva = g_buildProfile->engineSingletonRva;
 
         static constexpr std::uint8_t prepare[] = {
             0x48,0x85,0xD2,0x0F,0,0,0,0,0,0x48,0x8B,0xC4,0x55,0x56,0x57,0x41,
@@ -669,12 +718,24 @@ float4 PSMain(VertexOutput input) : SV_Target
         g_haveAppliedCameraBasis = true;
         const std::uint64_t application = g_hmdApplyCount.fetch_add(1) + 1;
         if (application % 120 == 0)
-            logging::Info("HMD camera rotation applied");
+        {
+            char message[256]{};
+            sprintf_s(message, "HMD camera rotation applied relative=(%.4f,%.4f,%.4f,%.4f) basis_delta=%.5f",
+                relative.x, relative.y, relative.z, relative.w,
+                BasisDistance(g_baseCameraBasis, rotated));
+            logging::Info(message);
+        }
     }
 
     float* __fastcall HookedCameraRefresh(OpaqueCamera* camera, void* output)
     {
+        const bool applyHmdRotation = g_projectionRefreshDepth != 0 &&
+            camera == g_projectionContextCamera;
+        if (applyHmdRotation)
+            ApplyHmdRotationToCamera(camera);
+
         float* result = g_cameraRefresh(camera, output);
+
         const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
         const std::uintptr_t callerRva = caller >= g_moduleBase &&
             caller < g_moduleBase + kImageSize ? caller - g_moduleBase : 0;
@@ -704,9 +765,6 @@ float4 PSMain(VertexOutput input) : SV_Target
                 }
             }
         }
-        if (callerRva == 0x007A11B5 || callerRva == 0x00929AF6 ||
-            callerRva == 0x009DAA67)
-            ApplyHmdRotationToCamera(camera);
         return result;
     }
 
@@ -780,6 +838,9 @@ float4 PSMain(VertexOutput input) : SV_Target
         ++g_projectionRefreshDepth;
         const std::uintptr_t result = g_projectionDispatch(context, mode);
         --g_projectionRefreshDepth;
+        // Deferred rendering still consumes this primary FrameBase after the
+        // dispatch returns. Auxiliary object cameras are separate instances
+        // and are excluded by HookedCameraRefresh.
         g_projectionContextCamera = previousProjectionCamera;
         return result;
     }
@@ -1030,6 +1091,40 @@ float4 PSMain(VertexOutput input) : SV_Target
         return depthDisabled;
     }
 
+    bool IsInventoryLayerDraw(ID3D11DeviceContext* context, std::uintptr_t caller,
+        ID3D11RenderTargetView* target) noexcept
+    {
+        if (g_hudCompositeWidth <= 0.0f || g_hudCompositeHeight <= 0.0f || !target ||
+            caller != g_moduleBase + 0x002600DD)
+            return false;
+
+        ApiEvent targetDescription{};
+        DescribeResource(target, targetDescription);
+        if (targetDescription.width < 1000 || targetDescription.height < 1000)
+            return false;
+
+        ID3D11RasterizerState* rasterizerState{};
+        context->RSGetState(&rasterizerState);
+        D3D11_RASTERIZER_DESC rasterizerDescription{};
+        if (rasterizerState)
+            rasterizerState->GetDesc(&rasterizerDescription);
+        if (rasterizerState)
+            rasterizerState->Release();
+        if (!rasterizerDescription.ScissorEnable)
+            return false;
+
+        UINT scissorCount = 1;
+        D3D11_RECT scissor{};
+        context->RSGetScissorRects(&scissorCount, &scissor);
+        if (!scissorCount)
+            return false;
+        const LONG width = scissor.right - scissor.left;
+        const LONG height = scissor.bottom - scissor.top;
+        return width >= 16 && height >= 16 &&
+            (width < static_cast<LONG>(targetDescription.width) ||
+             height < static_cast<LONG>(targetDescription.height));
+    }
+
     bool EnsureHudLayer(const D3D11_TEXTURE2D_DESC& source) noexcept
     {
         if (!g_d3dDevice)
@@ -1079,14 +1174,15 @@ float4 PSMain(VertexOutput input) : SV_Target
     };
 
     bool BeginHudLayerDraw(ID3D11DeviceContext* context, std::uintptr_t caller,
-        HudRedirectState& original) noexcept
+        bool indexed, HudRedirectState& original) noexcept
     {
         ID3D11RenderTargetView* target{};
         ID3D11DepthStencilView* depth{};
         context->OMGetRenderTargets(1, &target, &depth);
         original.target.Attach(target);
         original.depth.Attach(depth);
-        if (!IsHudLayerDraw(context, caller, target))
+        if (indexed ? !IsInventoryLayerDraw(context, caller, target) :
+                !IsHudLayerDraw(context, caller, target))
             return false;
         Microsoft::WRL::ComPtr<ID3D11Resource> resource;
         target->GetResource(&resource);
@@ -1103,8 +1199,11 @@ float4 PSMain(VertexOutput input) : SV_Target
             g_clearRtv(context, g_hudLayerTarget.Get(), transparent);
         }
         ID3D11RenderTargetView* hudTarget = g_hudLayerTarget.Get();
-        g_omSetRenderTargets(context, 1, &hudTarget, nullptr);
+        g_omSetRenderTargets(context, 1, &hudTarget,
+            indexed ? original.depth.Get() : nullptr);
         g_hudLayerDirty = true;
+        if (indexed && !g_inventoryLayerLogged.exchange(true))
+            logging::Info("Inventory DrawIndexed redirected into HUD composite layer");
         if (!g_hudLayerLogged.exchange(true))
         {
             std::ostringstream message;
@@ -1121,7 +1220,15 @@ float4 PSMain(VertexOutput input) : SV_Target
         const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
         RecordHudCompositeCandidate(self, ApiKind::DrawIndexed, indexCount, caller);
         RecordAlphaDrawState(self, ApiKind::DrawIndexed, indexCount, caller);
+        HudRedirectState originalTargets{};
+        const bool redirected = BeginHudLayerDraw(self, caller, true, originalTargets);
         g_drawIndexed(self, indexCount, startIndex, baseVertex);
+        if (redirected)
+        {
+            ID3D11RenderTargetView* target = originalTargets.target.Get();
+            g_omSetRenderTargets(self, target ? 1u : 0u, target ? &target : nullptr,
+                originalTargets.depth.Get());
+        }
     }
 
     void STDMETHODCALLTYPE HookedDraw(ID3D11DeviceContext* self, UINT vertexCount,
@@ -1131,7 +1238,7 @@ float4 PSMain(VertexOutput input) : SV_Target
         RecordHudCompositeCandidate(self, ApiKind::Draw, vertexCount, caller);
         RecordAlphaDrawState(self, ApiKind::Draw, vertexCount, caller);
         HudRedirectState originalTargets{};
-        const bool redirected = BeginHudLayerDraw(self, caller, originalTargets);
+        const bool redirected = BeginHudLayerDraw(self, caller, false, originalTargets);
         g_draw(self, vertexCount, startVertex);
         if (redirected)
         {
@@ -1272,10 +1379,38 @@ float4 PSMain(VertexOutput input) : SV_Target
         if (clientWidth <= 0.0f || clientHeight <= 0.0f || nativeWidth <= 0.0f ||
             nativeHeight <= 0.0f)
             return false;
-        point.x = static_cast<LONG>(std::lround(static_cast<float>(point.x) *
-            nativeWidth / clientWidth));
-        point.y = static_cast<LONG>(std::lround(static_cast<float>(point.y) *
-            nativeHeight / clientHeight));
+        const float backWidth = static_cast<float>(g_guiBackWidth.load());
+        const float backHeight = static_cast<float>(g_guiBackHeight.load());
+        if (g_hudCompositeWidth > 0.0f && g_hudCompositeHeight > 0.0f &&
+            backWidth > 0.0f && backHeight > 0.0f)
+        {
+            const float compositeWidth = (std::clamp)(g_hudCompositeWidth, 64.0f,
+                backWidth);
+            const float compositeHeight = (std::clamp)(g_hudCompositeHeight, 64.0f,
+                backHeight);
+            const float contentScale = (std::clamp)(g_hudContentScale, 0.05f, 4.0f);
+            const float contentWidth = compositeWidth * contentScale;
+            const float contentHeight = compositeHeight * contentScale;
+            const unsigned eye = dayz::stereo_state::RenderedEye();
+            const float eyeOffsetX = eye == 0 ? g_hudLeftOffsetX : g_hudRightOffsetX;
+            const float left = (backWidth - contentWidth) * 0.5f + eyeOffsetX;
+            const float top = (backHeight - contentHeight) * 0.5f;
+            const float backX = static_cast<float>(point.x) * backWidth / clientWidth;
+            const float backY = static_cast<float>(point.y) * backHeight / clientHeight;
+            point.x = static_cast<LONG>(std::lround((backX - left) * nativeWidth /
+                contentWidth));
+            point.y = static_cast<LONG>(std::lround((backY - top) * nativeHeight /
+                contentHeight));
+        }
+        else
+        {
+            point.x = static_cast<LONG>(std::lround(static_cast<float>(point.x) *
+                nativeWidth / clientWidth));
+            point.y = static_cast<LONG>(std::lround(static_cast<float>(point.y) *
+                nativeHeight / clientHeight));
+        }
+        point.x = (std::clamp)(point.x, 0L, static_cast<LONG>(nativeWidth) - 1);
+        point.y = (std::clamp)(point.y, 0L, static_cast<LONG>(nativeHeight) - 1);
         return true;
     }
 
@@ -1519,6 +1654,7 @@ float4 PSMain(VertexOutput input) : SV_Target
     HudCompositeConstants CurrentHudCompositeConstants() noexcept
     {
         HudCompositeConstants constants{};
+        constants.contentScale = (std::clamp)(g_hudContentScale, 0.05f, 4.0f);
         const float nativeWidth = static_cast<float>(g_guiNativeWidth.load());
         const float nativeHeight = static_cast<float>(g_guiNativeHeight.load());
         constants.cursorPixelUv[0] = nativeWidth > 0.0f ? 1.0f / nativeWidth : 1.0f;
@@ -1712,6 +1848,7 @@ namespace dayz::runtime_probe
         g_hudSafeHeight = ReadFloat(L"stereo", L"hud_safe_height", 0.0f);
         g_hudCompositeWidth = ReadFloat(L"stereo", L"hud_composite_width", 0.0f);
         g_hudCompositeHeight = ReadFloat(L"stereo", L"hud_composite_height", 0.0f);
+        g_hudContentScale = ReadFloat(L"stereo", L"hud_content_scale", 1.0f);
         g_hudLeftOffsetX = ReadFloat(L"stereo", L"hud_left_offset_x", 0.0f);
         g_hudRightOffsetX = ReadFloat(L"stereo", L"hud_right_offset_x", 0.0f);
         g_guiMouseRemapEnabled = ReadBoolean(L"stereo", L"gui_mouse_remap", true);
@@ -1760,12 +1897,22 @@ namespace dayz::runtime_probe
                 return false;
             }
         g_active = true;
-        logging::Info("GUI internal mouse-position remap active at DayZ+0x351760");
+        {
+            std::ostringstream message;
+            message << "GUI internal mouse-position remap active at DayZ+0x" << std::hex
+                    << kGuiInputMessageRva;
+            logging::Info(message.str());
+        }
         if (InstallD3DHooks())
             logging::Info("DayZ stereo D3D11 target probe active");
         else
             logging::Error("DayZ stereo D3D11 target probe unavailable; render trace remains active");
-        logging::Info("DayZ stereo runtime probe active: build and four render signatures verified");
+        {
+            std::ostringstream message;
+            message << "DayZ stereo runtime probe active: " << g_buildProfile->name
+                    << " build and five render signatures verified";
+            logging::Info(message.str());
+        }
         if (g_alternateEyeEnabled)
         {
             const char* fitModeName = fitMode == dayz::stereo_state::FitMode::Stretch
@@ -1780,7 +1927,8 @@ namespace dayz::runtime_probe
                 << " hud_safe=" << g_hudSafeWidth << 'x' << g_hudSafeHeight
                 << " hud_composite_layer=" << g_hudCompositeWidth << 'x'
                 << g_hudCompositeHeight << " hud_eye_offsets=" << g_hudLeftOffsetX << ','
-                << g_hudRightOffsetX << " gui_mouse_remap=" << g_guiMouseRemapEnabled
+                << g_hudRightOffsetX << " hud_content_scale=" << g_hudContentScale
+                << " gui_mouse_remap=" << g_guiMouseRemapEnabled
                 << " gui_cursor=" << g_guiCursorEnabled;
             logging::Info(message.str());
         }
