@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="dxgi/dxgi.vcxproj" />
+  <Project Path="xr_probe/xr_probe.vcxproj" />
+</Solution>

@@ -1,0 +1,42 @@
+# Visual Studio user state and generated metadata
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build outputs and intermediate files
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.obj
+*.pch
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.tlog
+*.lastbuildstate
+*.recipe
+
+# Runtime logs, dumps, and temporary files
+*.log
+*.dmp
+*.tmp
+*.temp
+*.bak
+*.userprefs
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
