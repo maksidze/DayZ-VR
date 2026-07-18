@@ -810,6 +810,11 @@ float4 PSMain(VertexOutput input) : SV_Target
     void __fastcall HookedPrepareView(OpaqueEngine* engine, OpaqueContext* context,
         std::uint8_t mode, OpaqueCamera* camera)
     {
+        // Projection identifies the primary FrameBase, but DayZ prepares that
+        // same object again before copying it into the render context. Reapply
+        // HMD here in case game-side camera state was refreshed in between.
+        if (g_hmdRotationEnabled && camera && camera == g_lastHmdCamera)
+            ApplyHmdRotationToCamera(camera);
         Record(EventKind::Prepare, context, mode, camera);
         g_prepareView(engine, context, mode, camera);
     }
