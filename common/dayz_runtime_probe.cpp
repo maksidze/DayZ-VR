@@ -72,6 +72,7 @@ namespace
     using FinalizeViewFn = std::uintptr_t(__fastcall*)(OpaqueEngine*, OpaqueContext*,
         std::uint8_t);
     using ProjectionDispatchFn = std::uintptr_t(__fastcall*)(OpaqueContext*, std::uint8_t);
+    using FrameRefreshFn = std::uintptr_t(__fastcall*)(OpaqueCamera*, void*, std::uint8_t);
     using HudLayoutFn = char(__fastcall*)(void*);
     using CameraRefreshFn = float*(__fastcall*)(OpaqueCamera*, void*);
     using GuiInputMessageFn = std::int64_t(__fastcall*)(void*, std::int64_t, unsigned int,
@@ -101,10 +102,13 @@ namespace
     ExecuteViewFn g_executeView{};
     FinalizeViewFn g_finalizeView{};
     ProjectionDispatchFn g_projectionDispatch{};
+    FrameRefreshFn g_frameRefresh{};
     HudLayoutFn g_hudLayout{};
     CameraRefreshFn g_cameraRefresh{};
     GuiInputMessageFn g_guiInputMessage{};
     std::atomic_bool g_cameraRefreshHookAttempted{};
+    std::atomic_bool g_frameRefreshHookActive{};
+    std::uintptr_t g_frameRefreshTarget{};
     Microsoft::WRL::ComPtr<ID3D11Device> g_d3dDevice;
 
     using OmSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
@@ -178,6 +182,14 @@ namespace
     std::atomic_bool g_captureApi{};
     bool g_alternateEyeEnabled{};
     bool g_hmdRotationEnabled{};
+    bool g_hmdNativeAimEnabled{true};
+    float g_hmdMouseYawScale{-600.0f};
+    float g_hmdMousePitchScale{-600.0f};
+    bool g_haveNativeHmdAngles{};
+    float g_previousHmdYaw{};
+    float g_previousHmdPitch{};
+    double g_pendingMouseX{};
+    double g_pendingMouseY{};
     float g_cameraSeparation{0.064f};
     float g_hudScale{0.85f};
     bool g_overrideHudScale{};
@@ -460,6 +472,26 @@ float4 PSMain(VertexOutput input) : SV_Target
         return true;
     }
 
+    std::uintptr_t ResolveFrameRefreshTarget() noexcept
+    {
+        // ProjectionDispatch is a small wrapper whose only direct relative call
+        // refreshes the FrameBase and builds all cached view/projection matrices.
+        const auto* code = reinterpret_cast<const std::uint8_t*>(
+            g_moduleBase + kProjectionDispatchRva);
+        for (std::size_t offset = 0; offset + 5 <= 64; ++offset)
+        {
+            if (code[offset] != 0xE8)
+                continue;
+            const std::int32_t displacement = *reinterpret_cast<const std::int32_t*>(
+                code + offset + 1);
+            const std::uintptr_t target = reinterpret_cast<std::uintptr_t>(code + offset + 5) +
+                displacement;
+            if (target >= g_moduleBase && target < g_moduleBase + kImageSize)
+                return target;
+        }
+        return 0;
+    }
+
     bool ValidateBuild() noexcept
     {
         g_moduleBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
@@ -647,6 +679,23 @@ float4 PSMain(VertexOutput input) : SV_Target
             distance(a.forward, b.forward);
     }
 
+    float VectorLength(const Vec3& value) noexcept
+    {
+        return std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
+    }
+
+    Vec3 Divide(const Vec3& value, float divisor) noexcept
+    {
+        if (divisor <= 0.000001f)
+            return value;
+        return {value.x / divisor, value.y / divisor, value.z / divisor};
+    }
+
+    Vec3 Scale(const Vec3& value, float factor) noexcept
+    {
+        return {value.x * factor, value.y * factor, value.z * factor};
+    }
+
     Vec3 MapOpenXrVectorToCamera(const CameraBasis& base, const Vec3& value) noexcept
     {
         return {
@@ -680,6 +729,18 @@ float4 PSMain(VertexOutput input) : SV_Target
         const Quaternion inverseCenter{-g_hmdCenter.x, -g_hmdCenter.y, -g_hmdCenter.z,
             g_hmdCenter.w};
         const Quaternion relative = Normalize(Multiply(inverseCenter, current));
+        Quaternion renderRotation = relative;
+        if (g_hmdNativeAimEnabled)
+        {
+            // DayZ receives HMD yaw/pitch through its native mouse path so all
+            // gameplay systems share them. Only roll remains a render-space
+            // transform because a conventional mouse camera has no roll axis.
+            const float roll = std::atan2(
+                2.0f * (relative.w * relative.z + relative.x * relative.y),
+                1.0f - 2.0f * (relative.x * relative.x + relative.z * relative.z));
+            const float halfRoll = roll * 0.5f;
+            renderRotation = {0.0f, 0.0f, std::sin(halfRoll), std::cos(halfRoll)};
+        }
         const auto address = reinterpret_cast<std::uintptr_t>(camera);
         CameraBasis gameBasis{};
         __try
@@ -696,13 +757,24 @@ float4 PSMain(VertexOutput input) : SV_Target
             BasisDistance(gameBasis, g_lastAppliedCameraBasis) > 0.0001f)
             g_baseCameraBasis = gameBasis;
 
-        const Vec3 xrRight = Rotate(relative, {1.0f, 0.0f, 0.0f});
-        const Vec3 xrUp = Rotate(relative, {0.0f, 1.0f, 0.0f});
-        const Vec3 xrForward = Rotate(relative, {0.0f, 0.0f, -1.0f});
+        const Vec3 xrRight = Rotate(renderRotation, {1.0f, 0.0f, 0.0f});
+        const Vec3 xrUp = Rotate(renderRotation, {0.0f, 1.0f, 0.0f});
+        const Vec3 xrForward = Rotate(renderRotation, {0.0f, 0.0f, -1.0f});
+        // FrameBase axes may carry different scale factors. Multiplying the raw
+        // scaled basis by the HMD rotation computes S*R and introduces shear
+        // (the image becomes a diamond). Rotate an orthogonal unit basis first,
+        // then restore each DayZ axis scale: R*S.
+        const float rightScale = VectorLength(g_baseCameraBasis.right);
+        const float upScale = VectorLength(g_baseCameraBasis.up);
+        const float forwardScale = VectorLength(g_baseCameraBasis.forward);
+        const CameraBasis unitBasis{
+            Divide(g_baseCameraBasis.right, rightScale),
+            Divide(g_baseCameraBasis.up, upScale),
+            Divide(g_baseCameraBasis.forward, forwardScale)};
         const CameraBasis rotated{
-            MapOpenXrVectorToCamera(g_baseCameraBasis, xrRight),
-            MapOpenXrVectorToCamera(g_baseCameraBasis, xrUp),
-            MapOpenXrVectorToCamera(g_baseCameraBasis, xrForward)};
+            Scale(MapOpenXrVectorToCamera(unitBasis, xrRight), rightScale),
+            Scale(MapOpenXrVectorToCamera(unitBasis, xrUp), upScale),
+            Scale(MapOpenXrVectorToCamera(unitBasis, xrForward), forwardScale)};
         __try
         {
             *reinterpret_cast<Vec3*>(address + 0x08) = rotated.right;
@@ -727,10 +799,27 @@ float4 PSMain(VertexOutput input) : SV_Target
         }
     }
 
+    std::uintptr_t __fastcall HookedFrameRefresh(OpaqueCamera* camera, void* engine,
+        std::uint8_t rebuild)
+    {
+        // This is deliberately done before DayZ derives any view, inverse-view,
+        // culling or view-projection matrices. Applying it in the virtual basis
+        // getter is too late: several consumers have already cached the old pose.
+        if (g_projectionRefreshDepth != 0 && camera == g_projectionContextCamera)
+            ApplyHmdRotationToCamera(camera);
+        return g_frameRefresh(camera, engine, rebuild);
+    }
+
     float* __fastcall HookedCameraRefresh(OpaqueCamera* camera, void* output)
     {
-        const bool applyHmdRotation = g_projectionRefreshDepth != 0 &&
+        // The same primary FrameBase getter is consumed by gameplay aiming and
+        // first-person attachment preparation outside ProjectionDispatch. Keep
+        // those consumers on the HMD pose too, but never touch auxiliary object
+        // cameras (inventory, hotbar, world items, mirrors, etc.).
+        const bool primaryProjectionCamera = g_projectionRefreshDepth != 0 &&
             camera == g_projectionContextCamera;
+        const bool knownPlayerCamera = camera && camera == g_lastHmdCamera;
+        const bool applyHmdRotation = primaryProjectionCamera || knownPlayerCamera;
         if (applyHmdRotation)
             ApplyHmdRotationToCamera(camera);
 
@@ -1429,6 +1518,59 @@ float4 PSMain(VertexOutput input) : SV_Target
         return result && (info.flags & CURSOR_SHOWING) != 0;
     }
 
+    void UpdateNativeHmdAim() noexcept
+    {
+        if (!g_hmdRotationEnabled || !g_hmdNativeAimEnabled)
+            return;
+        const dayz::stereo_state::HmdOrientation orientation =
+            dayz::stereo_state::GetHmdOrientation();
+        if (!orientation.valid)
+            return;
+        const Quaternion current = Normalize({orientation.x, orientation.y, orientation.z,
+            orientation.w});
+        const float yaw = std::atan2(
+            2.0f * (current.w * current.y + current.x * current.z),
+            1.0f - 2.0f * (current.x * current.x + current.y * current.y));
+        const float pitch = std::asin((std::clamp)(
+            2.0f * (current.w * current.x - current.z * current.y), -1.0f, 1.0f));
+        if (!g_haveNativeHmdAngles)
+        {
+            g_previousHmdYaw = yaw;
+            g_previousHmdPitch = pitch;
+            g_haveNativeHmdAngles = true;
+            return;
+        }
+
+        const float yawDelta = (std::clamp)(
+            std::remainder(yaw - g_previousHmdYaw, 2.0f * 3.14159265358979323846f),
+            -0.35f, 0.35f);
+        const float pitchDelta = (std::clamp)(pitch - g_previousHmdPitch, -0.35f, 0.35f);
+        g_previousHmdYaw = yaw;
+        g_previousHmdPitch = pitch;
+
+        // Do not accumulate head movement while an inventory/menu cursor is up;
+        // resuming gameplay must not produce a sudden camera jump.
+        if (!g_gameWindow || GetForegroundWindow() != g_gameWindow ||
+            IsGuiCursorModeActive())
+            return;
+
+        g_pendingMouseX += static_cast<double>(yawDelta) * g_hmdMouseYawScale;
+        g_pendingMouseY += static_cast<double>(pitchDelta) * g_hmdMousePitchScale;
+        const LONG mouseX = static_cast<LONG>(std::trunc(g_pendingMouseX));
+        const LONG mouseY = static_cast<LONG>(std::trunc(g_pendingMouseY));
+        g_pendingMouseX -= mouseX;
+        g_pendingMouseY -= mouseY;
+        if (!mouseX && !mouseY)
+            return;
+
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dx = mouseX;
+        input.mi.dy = mouseY;
+        input.mi.dwFlags = MOUSEEVENTF_MOVE;
+        SendInput(1, &input, sizeof(input));
+    }
+
     bool CenterPhysicalCursor(POINT& center) noexcept
     {
         RECT client{};
@@ -1846,6 +1988,9 @@ namespace dayz::runtime_probe
         }
         g_alternateEyeEnabled = ReadBoolean(L"stereo", L"alternate_eye", false);
         g_hmdRotationEnabled = ReadBoolean(L"stereo", L"hmd_rotation", true);
+        g_hmdNativeAimEnabled = ReadBoolean(L"stereo", L"hmd_native_aim", true);
+        g_hmdMouseYawScale = ReadFloat(L"stereo", L"hmd_mouse_yaw_scale", -600.0f);
+        g_hmdMousePitchScale = ReadFloat(L"stereo", L"hmd_mouse_pitch_scale", -600.0f);
         g_cameraSeparation = ReadFloat(L"stereo", L"camera_separation", 0.064f);
         g_hudScale = ReadFloat(L"stereo", L"hud_scale", 0.85f);
         g_overrideHudScale = ReadBoolean(L"stereo", L"override_hud_scale", false);
@@ -1876,6 +2021,17 @@ namespace dayz::runtime_probe
             return false;
         }
         InstallGuiMouseApiHook();
+        bool frameRefreshHookCreated{};
+        if (g_hmdRotationEnabled)
+        {
+            g_frameRefreshTarget = ResolveFrameRefreshTarget();
+            if (g_frameRefreshTarget)
+                frameRefreshHookCreated = MH_CreateHook(
+                    reinterpret_cast<void*>(g_frameRefreshTarget), HookedFrameRefresh,
+                    reinterpret_cast<void**>(&g_frameRefresh)) == MH_OK;
+            if (!frameRefreshHookCreated)
+                logging::Error("Full FrameBase refresh hook unavailable; using camera-basis fallback");
+        }
         if (!AddHook(kPrepareViewRva, HookedPrepareView, g_prepareView) ||
             !AddHook(kExecuteViewRva, HookedExecuteView, g_executeView) ||
             !AddHook(kFinalizeViewRva, HookedFinalizeView, g_finalizeView) ||
@@ -1901,6 +2057,21 @@ namespace dayz::runtime_probe
                 logging::Error("DayZ stereo runtime probe hook enable failed; hooks disabled");
                 return false;
             }
+        if (frameRefreshHookCreated)
+        {
+            const MH_STATUS enabled = MH_EnableHook(
+                reinterpret_cast<void*>(g_frameRefreshTarget));
+            if (enabled == MH_OK || enabled == MH_ERROR_ENABLED)
+            {
+                g_frameRefreshHookActive = true;
+                std::ostringstream message;
+                message << "HMD full FrameBase refresh hook active at DayZ+0x" << std::hex
+                    << (g_frameRefreshTarget - g_moduleBase);
+                logging::Info(message.str());
+            }
+            else
+                logging::Error("Full FrameBase refresh hook could not be enabled; using camera-basis fallback");
+        }
         g_active = true;
         {
             std::ostringstream message;
@@ -1926,6 +2097,9 @@ namespace dayz::runtime_probe
             message << "Alternating-eye stereo validation enabled; camera_separation="
                 << g_cameraSeparation << " image_shift=" << imageShift
                 << " hmd_rotation=" << g_hmdRotationEnabled
+                << " hmd_native_aim=" << g_hmdNativeAimEnabled
+                << " hmd_mouse_scale=" << g_hmdMouseYawScale << ','
+                << g_hmdMousePitchScale
                 << " fit_mode=" << fitModeName
                 << " scale=" << scaleX << 'x' << scaleY
                 << " hud_scale_override=" << g_overrideHudScale
@@ -1959,6 +2133,7 @@ namespace dayz::runtime_probe
     {
         if (!g_active.load(std::memory_order_relaxed))
             return;
+        UpdateNativeHmdAim();
         const std::uint64_t frame = g_presentCount.fetch_add(1) + 1;
         if (g_overrideHudScale)
             WriteHudScale();
