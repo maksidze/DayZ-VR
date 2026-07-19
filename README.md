@@ -7,7 +7,7 @@ An experimental, unofficial VR prototype for the Windows x64 version of DayZ. It
 [![DayZ OpenXR VR Mod](https://img.youtube.com/vi/35tf5tsaD5c/0.jpg)](https://youtu.be/35tf5tsaD5c)
 
 > [!WARNING]
-> This mod is **not compatible with anti-cheat software**. It loads a local `dxgi.dll` proxy and installs hooks in the game process, behavior that anti-cheat systems can detect or block. Do not use it on BattlEye-protected or other anti-cheat-enabled servers. Use it only in a private, offline, or otherwise explicitly permitted environment. You assume all risk, including crashes, account restrictions, or bans.
+> This mod is **not compatible with anti-cheat software**. It loads a local `dxgi.dll` proxy and installs hooks in the game process, behavior that anti-cheat systems can detect or block. Do not use it on BattlEye-protected or other anti-cheat-enabled servers. Use it only in a private, offline, or otherwise explicitly permitted environment. You assume all risk, including crashes, account restrictions, or bans. For the mod to work, the server must have anti-cheat disabled using the program https://github.com/JonathanEke/DayZ-Server-Battleye-Remover
 
 ## How it works
 
