@@ -2,6 +2,10 @@
 
 An experimental, unofficial VR prototype for the Windows x64 version of DayZ. It presents DayZ through an OpenXR runtime and modifies selected rendering, camera, GUI, and mouse-input behavior inside the running game. The proxy currently recognizes the matching retail `DayZ_x64.exe` and diagnostic `DayZDiag_x64.exe` builds.
 
+## Showcase video
+
+[![DayZ OpenXR VR Mod](https://img.youtube.com/vi/35tf5tsaD5c/0.jpg)](https://youtu.be/35tf5tsaD5c)
+
 > [!WARNING]
 > This mod is **not compatible with anti-cheat software**. It loads a local `dxgi.dll` proxy and installs hooks in the game process, behavior that anti-cheat systems can detect or block. Do not use it on BattlEye-protected or other anti-cheat-enabled servers. Use it only in a private, offline, or otherwise explicitly permitted environment. You assume all risk, including crashes, account restrictions, or bans.
 
