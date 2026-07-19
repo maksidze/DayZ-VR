@@ -2,6 +2,7 @@
 
 #include "debug_frame_source.hpp"
 #include "dayz_frame_source.hpp"
+#include "dayz_runtime_probe.hpp"
 #include "stereo_state.hpp"
 #include "logging.hpp"
 
@@ -42,6 +43,43 @@ namespace
             static_cast<DWORD>(std::size(value)), configPath.c_str());
         return _wcsicmp(value, L"true") == 0 || _wcsicmp(value, L"yes") == 0 ||
             _wcsicmp(value, L"on") == 0 || wcscmp(value, L"1") == 0;
+    }
+
+    bool ReadBoolean(const wchar_t* section, const wchar_t* key, bool fallback) noexcept
+    {
+        wchar_t value[16]{};
+        GetPrivateProfileStringW(section, key, fallback ? L"true" : L"false", value,
+            static_cast<DWORD>(std::size(value)), ConfigurationPath().c_str());
+        return _wcsicmp(value, L"true") == 0 || _wcsicmp(value, L"yes") == 0 ||
+            _wcsicmp(value, L"on") == 0 || wcscmp(value, L"1") == 0;
+    }
+
+    float ReadFloat(const wchar_t* section, const wchar_t* key, float fallback) noexcept
+    {
+        wchar_t fallbackText[32]{};
+        swprintf_s(fallbackText, L"%.3f", fallback);
+        wchar_t value[32]{};
+        GetPrivateProfileStringW(section, key, fallbackText, value,
+            static_cast<DWORD>(std::size(value)), ConfigurationPath().c_str());
+        wchar_t* end{};
+        const float parsed = std::wcstof(value, &end);
+        return end != value && std::isfinite(parsed) ? parsed : fallback;
+    }
+
+    std::uint32_t ReadUnsigned(const wchar_t* section, const wchar_t* key,
+        std::uint32_t fallback) noexcept
+    {
+        return static_cast<std::uint32_t>((std::max)(1u, GetPrivateProfileIntW(section,
+            key, static_cast<int>(fallback), ConfigurationPath().c_str())));
+    }
+
+    XrQuaternionf YawOnly(const XrQuaternionf& orientation) noexcept
+    {
+        const float yaw = std::atan2(2.0f * (orientation.w * orientation.y +
+            orientation.x * orientation.z), 1.0f - 2.0f *
+            (orientation.x * orientation.x + orientation.y * orientation.y));
+        const float half = yaw * 0.5f;
+        return {0.0f, std::sin(half), 0.0f, std::cos(half)};
     }
 }
 
@@ -305,7 +343,72 @@ bool OpenXrHost::CreateSwapchains()
             }
         }
     }
+    if (guiQuadEnabled_ && !CreateGuiSwapchain(formats))
+    {
+        logging::Error("GUI quad swapchain is unavailable; projection rendering will continue");
+        guiQuadEnabled_ = false;
+    }
     logging::Info("Stereo swapchains are ready");
+    return true;
+}
+
+bool OpenXrHost::CreateGuiSwapchain(const std::vector<std::int64_t>& formats)
+{
+    const DXGI_FORMAT preferred[] = {DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB};
+    DXGI_FORMAT selected = DXGI_FORMAT_UNKNOWN;
+    for (const auto candidate : preferred)
+        if (std::find(formats.begin(), formats.end(), static_cast<std::int64_t>(candidate)) !=
+            formats.end())
+        {
+            selected = candidate;
+            break;
+        }
+    if (selected == DXGI_FORMAT_UNKNOWN)
+        return false;
+
+    guiSwapchain_.width = (std::clamp)(ReadUnsigned(L"gui", L"quad_pixel_width", 1920),
+        512u, 4096u);
+    guiSwapchain_.height = (std::clamp)(ReadUnsigned(L"gui", L"quad_pixel_height", 1400),
+        512u, 4096u);
+    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    info.format = selected;
+    info.sampleCount = 1;
+    info.width = guiSwapchain_.width;
+    info.height = guiSwapchain_.height;
+    info.faceCount = 1;
+    info.arraySize = 1;
+    info.mipCount = 1;
+    if (!Check(xrCreateSwapchain(session_, &info, &guiSwapchain_.handle),
+        "xrCreateSwapchain(gui)"))
+        return false;
+
+    std::uint32_t imageCount{};
+    if (!Check(xrEnumerateSwapchainImages(guiSwapchain_.handle, 0, &imageCount, nullptr),
+        "xrEnumerateSwapchainImages(gui count)"))
+        return false;
+    guiSwapchain_.images.resize(imageCount);
+    for (auto& image : guiSwapchain_.images)
+        image.type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+    if (!Check(xrEnumerateSwapchainImages(guiSwapchain_.handle, imageCount, &imageCount,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(guiSwapchain_.images.data())),
+        "xrEnumerateSwapchainImages(gui list)"))
+        return false;
+
+    guiSwapchain_.rtvs.resize(imageCount);
+    D3D11_RENDER_TARGET_VIEW_DESC rtvDescription{};
+    rtvDescription.Format = selected;
+    rtvDescription.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    for (std::size_t index = 0; index < imageCount; ++index)
+        if (FAILED(device_->CreateRenderTargetView(guiSwapchain_.images[index].texture,
+            &rtvDescription, &guiSwapchain_.rtvs[index])))
+            return false;
+
+    std::ostringstream message;
+    message << "GUI quad swapchain ready: " << guiSwapchain_.width << 'x'
+        << guiSwapchain_.height << " images=" << imageCount;
+    logging::Info(message.str());
     return true;
 }
 
@@ -313,6 +416,13 @@ bool OpenXrHost::FinishInitialization(ID3D11Device* device)
 {
     device_ = device;
     device_->GetImmediateContext(&context_);
+    guiQuadEnabled_ = ReadBoolean(L"gui", L"quad_enabled", true);
+    guiQuadWidthMeters_ = (std::clamp)(ReadFloat(L"gui", L"quad_width_meters", 1.4f),
+        0.4f, 4.0f);
+    guiQuadDistance_ = (std::clamp)(ReadFloat(L"gui", L"quad_distance", 1.25f),
+        0.4f, 5.0f);
+    guiQuadVerticalOffset_ = (std::clamp)(ReadFloat(L"gui", L"quad_vertical_offset", -0.1f),
+        -2.0f, 2.0f);
     logging::Info("Creating OpenXR session");
     if (!CreateSession())
         return false;
@@ -402,6 +512,22 @@ void OpenXrHost::PollEvents()
     }
 }
 
+void OpenXrHost::AnchorGuiQuad(const XrPosef& headPose) noexcept
+{
+    const XrQuaternionf yaw = YawOnly(headPose.orientation);
+    const XrVector3f forward{
+        -2.0f * (yaw.x * yaw.z + yaw.w * yaw.y),
+        -2.0f * (yaw.y * yaw.z - yaw.w * yaw.x),
+        -(1.0f - 2.0f * (yaw.x * yaw.x + yaw.y * yaw.y))};
+    guiQuadPose_.orientation = yaw;
+    guiQuadPose_.position = {
+        headPose.position.x + forward.x * guiQuadDistance_,
+        headPose.position.y + forward.y * guiQuadDistance_ + guiQuadVerticalOffset_,
+        headPose.position.z + forward.z * guiQuadDistance_};
+    guiQuadAnchored_ = true;
+    logging::Info("GUI quad anchored in LOCAL space");
+}
+
 void OpenXrHost::RenderFrame()
 {
     XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
@@ -424,6 +550,12 @@ void OpenXrHost::RenderFrame()
     const bool located = Check(xrLocateViews(session_, &locate, &viewState,
         static_cast<std::uint32_t>(views_.size()), &viewCount, views_.data()), "xrLocateViews") && viewCount == 2;
 
+#ifdef _WINDLL
+    const bool guiVisible = guiQuadEnabled_ && guiSwapchain_.handle != XR_NULL_HANDLE &&
+        dayz::runtime_probe::IsGuiQuadVisible();
+#else
+    const bool guiVisible = false;
+#endif
     if (frameState.shouldRender && located)
     {
         dayz::stereo_state::UpdateEyePositions(
@@ -491,19 +623,65 @@ void OpenXrHost::RenderFrame()
                 static_cast<std::int32_t>(swapchain.width), static_cast<std::int32_t>(swapchain.height)};
             layerView.subImage.imageArrayIndex = 0;
         }
+
+        if (guiVisible)
+        {
+            if (!guiQuadWasVisible_ || !guiQuadAnchored_)
+                AnchorGuiQuad(views_[0].pose);
+            std::uint32_t imageIndex{};
+            XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            if (Check(xrAcquireSwapchainImage(guiSwapchain_.handle, &acquire, &imageIndex),
+                "xrAcquireSwapchainImage(gui)"))
+            {
+                XrSwapchainImageWaitInfo imageWait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                imageWait.timeout = XR_INFINITE_DURATION;
+                if (Check(xrWaitSwapchainImage(guiSwapchain_.handle, &imageWait),
+                    "xrWaitSwapchainImage(gui)"))
+                {
+#ifdef _WINDLL
+                    guiQuadHasImage_ = dayz::runtime_probe::RenderGuiQuad(
+                        guiSwapchain_.rtvs[imageIndex].Get(), guiSwapchain_.width,
+                        guiSwapchain_.height) || guiQuadHasImage_;
+#endif
+                }
+                XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                Check(xrReleaseSwapchainImage(guiSwapchain_.handle, &release),
+                    "xrReleaseSwapchainImage(gui)");
+            }
+        }
+    }
+    guiQuadWasVisible_ = guiVisible;
+    if (!guiVisible)
+    {
+        guiQuadAnchored_ = false;
+        guiQuadHasImage_ = false;
     }
 
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     layer.space = localSpace_;
     layer.viewCount = static_cast<std::uint32_t>(projectionViews.size());
     layer.views = projectionViews.data();
-    const XrCompositionLayerBaseHeader* layers[] = {
-        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
+    XrCompositionLayerQuad guiLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    guiLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    guiLayer.space = localSpace_;
+    guiLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    guiLayer.subImage.swapchain = guiSwapchain_.handle;
+    guiLayer.subImage.imageRect.extent = {static_cast<std::int32_t>(guiSwapchain_.width),
+        static_cast<std::int32_t>(guiSwapchain_.height)};
+    guiLayer.pose = guiQuadPose_;
+    guiLayer.size.width = guiQuadWidthMeters_;
+    guiLayer.size.height = guiQuadWidthMeters_ * static_cast<float>(guiSwapchain_.height) /
+        static_cast<float>((std::max)(1u, guiSwapchain_.width));
+    std::array<const XrCompositionLayerBaseHeader*, 2> layers{
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer), nullptr};
+    std::uint32_t layerCount = frameState.shouldRender && located ? 1u : 0u;
+    if (layerCount && guiVisible && guiQuadHasImage_)
+        layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&guiLayer);
     XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime = frameState.predictedDisplayTime;
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    endInfo.layerCount = frameState.shouldRender && located ? 1u : 0u;
-    endInfo.layers = endInfo.layerCount ? layers : nullptr;
+    endInfo.layerCount = layerCount;
+    endInfo.layers = layerCount ? layers.data() : nullptr;
     Check(xrEndFrame(session_, &endInfo), "xrEndFrame");
 }
 
@@ -531,6 +709,11 @@ void OpenXrHost::Shutdown() noexcept
             xrDestroySwapchain(swapchain.handle);
         swapchain.handle = XR_NULL_HANDLE;
     }
+    guiSwapchain_.rtvs.clear();
+    guiSwapchain_.images.clear();
+    if (guiSwapchain_.handle != XR_NULL_HANDLE)
+        xrDestroySwapchain(guiSwapchain_.handle);
+    guiSwapchain_.handle = XR_NULL_HANDLE;
     if (viewSpace_ != XR_NULL_HANDLE) xrDestroySpace(viewSpace_);
     if (localSpace_ != XR_NULL_HANDLE) xrDestroySpace(localSpace_);
     if (session_ != XR_NULL_HANDLE) xrDestroySession(session_);

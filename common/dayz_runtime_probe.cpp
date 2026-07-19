@@ -36,15 +36,18 @@ namespace
         std::uintptr_t guiInputMessageRva;
         std::uintptr_t guiScaleRva;
         std::uintptr_t engineSingletonRva;
+        std::uintptr_t inventoryPreviewPrepareCallerRva;
+        std::uintptr_t dynamicBlurRva;
+        std::uintptr_t dynamicBlurParameterIndexRva;
     };
 
     constexpr std::array kBuildProfiles{
         BuildProfile{"DayZ_x64", 0x6A47B9AAu, 0x04407000u, 0x004501A0, 0x004513A0,
             0x004514B0, 0x00952B30, 0x008A2DB0, 0x00351760, 0x0427063C,
-            0x04263740},
+            0x04263740, 0x005C5899, 0x0022FB70, 0x00FEE968},
         BuildProfile{"DayZDiag_x64", 0x6A47BAF9u, 0x049E7000u, 0x0048D8A0, 0x0048EB30,
             0x0048EC40, 0x00B30D10, 0x00A7B7B0, 0x00389410, 0x04823F4C,
-            0x04815740},
+            0x04815740, 0, 0, 0},
     };
 
     const BuildProfile* g_buildProfile{};
@@ -57,6 +60,9 @@ namespace
     std::uintptr_t kGuiInputMessageRva{};
     std::uintptr_t kGuiScaleRva{};
     std::uintptr_t kEngineSingletonRva{};
+    std::uintptr_t kInventoryPreviewPrepareCallerRva{};
+    std::uintptr_t kDynamicBlurRva{};
+    std::uintptr_t kDynamicBlurParameterIndexRva{};
     constexpr std::ptrdiff_t kContextCamera = 0x118;
     constexpr std::ptrdiff_t kPreparedContextCamera = 0xA34;
     constexpr std::ptrdiff_t kContextDescriptor = 0xA10;
@@ -77,6 +83,8 @@ namespace
     using CameraRefreshFn = float*(__fastcall*)(OpaqueCamera*, void*);
     using GuiInputMessageFn = std::int64_t(__fastcall*)(void*, std::int64_t, unsigned int,
         std::int64_t, std::uintptr_t);
+    using DynamicBlurFn = void(__fastcall*)(std::int64_t, unsigned int, std::int64_t,
+        std::int64_t, int, int, int, std::int64_t);
 
     enum class EventKind : std::uint8_t { Projection, Prepare, Execute, Finalize };
     struct Event
@@ -106,6 +114,7 @@ namespace
     HudLayoutFn g_hudLayout{};
     CameraRefreshFn g_cameraRefresh{};
     GuiInputMessageFn g_guiInputMessage{};
+    DynamicBlurFn g_dynamicBlur{};
     std::atomic_bool g_cameraRefreshHookAttempted{};
     std::atomic_bool g_frameRefreshHookActive{};
     std::uintptr_t g_frameRefreshTarget{};
@@ -169,6 +178,7 @@ namespace
         std::uint32_t targetFormat{};
         std::uint32_t elementCount{};
         std::uintptr_t callerRva{};
+        std::uintptr_t parentCallerRva{};
         float viewportX{};
         float viewportY{};
         float viewportWidth{};
@@ -222,6 +232,22 @@ namespace
     std::atomic_bool g_hudLayerNeedsClear{true};
     std::atomic_bool g_hudLayerLogged{};
     std::atomic_bool g_inventoryLayerLogged{};
+    bool g_guiQuadEnabled{true};
+    bool g_inventoryHmdLookEnabled{true};
+    bool g_inventoryBlurEnabled{};
+    float g_inventoryPreviewRotationScale{0.5f};
+    std::atomic_bool g_inventoryPreviewActive{};
+    std::mutex g_guiLayerMutex;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> g_guiLayerTexture;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> g_guiLayerTarget;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> g_guiLayerResolved;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> g_guiLayerView;
+    std::uint32_t g_guiLayerWidth{};
+    std::uint32_t g_guiLayerHeight{};
+    DXGI_SAMPLE_DESC g_guiLayerSamples{};
+    std::atomic_bool g_guiLayerDirty{};
+    std::atomic_bool g_guiLayerNeedsClear{true};
+    std::atomic_bool g_guiLayerLogged{};
     bool g_guiMouseRemapEnabled{true};
     bool g_guiCursorEnabled{true};
     HWND g_gameWindow{};
@@ -238,6 +264,8 @@ namespace
     std::atomic_long g_guiVirtualCursorY{};
     std::atomic_bool g_guiVirtualCursorActive{};
     std::atomic_bool g_guiVirtualCursorApiLogged{};
+
+    bool IsGuiCursorModeActive() noexcept;
 
     struct HudCompositeConstants
     {
@@ -311,6 +339,12 @@ float4 PSMain(VertexOutput input) : SV_Target
     CameraBasis g_lastAppliedCameraBasis{};
     bool g_haveAppliedCameraBasis{};
     std::atomic_uint64_t g_hmdApplyCount{};
+    Quaternion g_inventoryPreviewHmdCenter{0.0f, 0.0f, 0.0f, 1.0f};
+    OpaqueCamera* g_inventoryPreviewCamera{};
+    CameraBasis g_inventoryPreviewBaseBasis{};
+    CameraBasis g_inventoryPreviewLastBasis{};
+    bool g_haveInventoryPreviewCenter{};
+    bool g_haveInventoryPreviewBasis{};
 
     void LogStereoApplication(unsigned eye, float offset)
     {
@@ -523,6 +557,10 @@ float4 PSMain(VertexOutput input) : SV_Target
         kGuiInputMessageRva = g_buildProfile->guiInputMessageRva;
         kGuiScaleRva = g_buildProfile->guiScaleRva;
         kEngineSingletonRva = g_buildProfile->engineSingletonRva;
+        kInventoryPreviewPrepareCallerRva =
+            g_buildProfile->inventoryPreviewPrepareCallerRva;
+        kDynamicBlurRva = g_buildProfile->dynamicBlurRva;
+        kDynamicBlurParameterIndexRva = g_buildProfile->dynamicBlurParameterIndexRva;
 
         static constexpr std::uint8_t prepare[] = {
             0x48,0x85,0xD2,0x0F,0,0,0,0,0,0x48,0x8B,0xC4,0x55,0x56,0x57,0x41,
@@ -730,7 +768,17 @@ float4 PSMain(VertexOutput input) : SV_Target
             g_hmdCenter.w};
         const Quaternion relative = Normalize(Multiply(inverseCenter, current));
         Quaternion renderRotation = relative;
-        if (g_hmdNativeAimEnabled)
+        const bool inventoryLook = g_inventoryHmdLookEnabled &&
+            g_inventoryPreviewActive.load(std::memory_order_relaxed) &&
+            g_haveInventoryPreviewCenter;
+        if (inventoryLook)
+        {
+            const Quaternion inverseInventoryCenter{-g_inventoryPreviewHmdCenter.x,
+                -g_inventoryPreviewHmdCenter.y, -g_inventoryPreviewHmdCenter.z,
+                g_inventoryPreviewHmdCenter.w};
+            renderRotation = Normalize(Multiply(inverseInventoryCenter, current));
+        }
+        else if (g_hmdNativeAimEnabled)
         {
             // DayZ receives HMD yaw/pitch through its native mouse path so all
             // gameplay systems share them. Only roll remains a render-space
@@ -797,6 +845,87 @@ float4 PSMain(VertexOutput input) : SV_Target
                 BasisDistance(g_baseCameraBasis, rotated));
             logging::Info(message);
         }
+    }
+
+    void ResetInventoryPreviewAnchor() noexcept
+    {
+        g_inventoryPreviewActive.store(false, std::memory_order_relaxed);
+        g_inventoryPreviewCamera = nullptr;
+        g_haveInventoryPreviewCenter = false;
+        g_haveInventoryPreviewBasis = false;
+    }
+
+    void ApplyInventoryPreviewRotation(OpaqueCamera* camera) noexcept
+    {
+        if (!g_hmdRotationEnabled || !camera)
+            return;
+        const dayz::stereo_state::HmdOrientation orientation =
+            dayz::stereo_state::GetHmdOrientation();
+        if (!orientation.valid)
+            return;
+        const Quaternion current = Normalize({orientation.x, orientation.y, orientation.z,
+            orientation.w});
+        if (!g_haveInventoryPreviewCenter)
+        {
+            g_inventoryPreviewHmdCenter = current;
+            g_haveInventoryPreviewCenter = true;
+            logging::Info("Inventory preview HMD anchor captured");
+        }
+        const Quaternion inverseCenter{-g_inventoryPreviewHmdCenter.x,
+            -g_inventoryPreviewHmdCenter.y, -g_inventoryPreviewHmdCenter.z,
+            g_inventoryPreviewHmdCenter.w};
+        const Quaternion relative = Normalize(Multiply(inverseCenter, current));
+        const float rotationScale = (std::clamp)(g_inventoryPreviewRotationScale, 0.0f,
+            2.0f);
+        const Quaternion scaledRelative = Normalize({relative.x * rotationScale,
+            relative.y * rotationScale, relative.z * rotationScale,
+            1.0f + (relative.w - 1.0f) * rotationScale});
+        const Quaternion menuLockedRotation{-scaledRelative.x, -scaledRelative.y,
+            -scaledRelative.z, scaledRelative.w};
+
+        const auto address = reinterpret_cast<std::uintptr_t>(camera);
+        CameraBasis gameBasis{};
+        __try
+        {
+            gameBasis.right = *reinterpret_cast<Vec3*>(address + 0x08);
+            gameBasis.up = *reinterpret_cast<Vec3*>(address + 0x14);
+            gameBasis.forward = *reinterpret_cast<Vec3*>(address + 0x20);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return;
+        }
+        if (!g_haveInventoryPreviewBasis || g_inventoryPreviewCamera != camera ||
+            BasisDistance(gameBasis, g_inventoryPreviewLastBasis) > 0.0001f)
+            g_inventoryPreviewBaseBasis = gameBasis;
+
+        const Vec3 xrRight = Rotate(menuLockedRotation, {1.0f, 0.0f, 0.0f});
+        const Vec3 xrUp = Rotate(menuLockedRotation, {0.0f, 1.0f, 0.0f});
+        const Vec3 xrForward = Rotate(menuLockedRotation, {0.0f, 0.0f, -1.0f});
+        const float rightScale = VectorLength(g_inventoryPreviewBaseBasis.right);
+        const float upScale = VectorLength(g_inventoryPreviewBaseBasis.up);
+        const float forwardScale = VectorLength(g_inventoryPreviewBaseBasis.forward);
+        const CameraBasis unitBasis{
+            Divide(g_inventoryPreviewBaseBasis.right, rightScale),
+            Divide(g_inventoryPreviewBaseBasis.up, upScale),
+            Divide(g_inventoryPreviewBaseBasis.forward, forwardScale)};
+        const CameraBasis rotated{
+            Scale(MapOpenXrVectorToCamera(unitBasis, xrRight), rightScale),
+            Scale(MapOpenXrVectorToCamera(unitBasis, xrUp), upScale),
+            Scale(MapOpenXrVectorToCamera(unitBasis, xrForward), forwardScale)};
+        __try
+        {
+            *reinterpret_cast<Vec3*>(address + 0x08) = rotated.right;
+            *reinterpret_cast<Vec3*>(address + 0x14) = rotated.up;
+            *reinterpret_cast<Vec3*>(address + 0x20) = rotated.forward;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return;
+        }
+        g_inventoryPreviewCamera = camera;
+        g_inventoryPreviewLastBasis = rotated;
+        g_haveInventoryPreviewBasis = true;
     }
 
     std::uintptr_t __fastcall HookedFrameRefresh(OpaqueCamera* camera, void* engine,
@@ -904,6 +1033,15 @@ float4 PSMain(VertexOutput input) : SV_Target
         // HMD here in case game-side camera state was refreshed in between.
         if (g_hmdRotationEnabled && camera && camera == g_lastHmdCamera)
             ApplyHmdRotationToCamera(camera);
+        const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+        const std::uintptr_t callerRva = caller >= g_moduleBase &&
+            caller < g_moduleBase + kImageSize ? caller - g_moduleBase : 0;
+        if (kInventoryPreviewPrepareCallerRva &&
+            callerRva == kInventoryPreviewPrepareCallerRva && IsGuiCursorModeActive())
+        {
+            g_inventoryPreviewActive.store(true, std::memory_order_relaxed);
+            ApplyInventoryPreviewRotation(camera);
+        }
         Record(EventKind::Prepare, context, mode, camera);
         g_prepareView(engine, context, mode, camera);
     }
@@ -944,6 +1082,48 @@ float4 PSMain(VertexOutput input) : SV_Target
         const char result = g_hudLayout(renderer);
         ApplyHudSafeArea(renderer);
         return result;
+    }
+
+    void __fastcall HookedDynamicBlur(std::int64_t effect, unsigned int view,
+        std::int64_t input, std::int64_t output, int a5, int a6, int a7,
+        std::int64_t parameters)
+    {
+        float* blurAmount{};
+        float savedAmount{};
+        if (!g_inventoryBlurEnabled &&
+            g_inventoryPreviewActive.load(std::memory_order_relaxed) && parameters &&
+            kDynamicBlurParameterIndexRva)
+        {
+            __try
+            {
+                const auto parameterTable = *reinterpret_cast<std::uintptr_t*>(parameters + 32);
+                const auto parameterIndex = *reinterpret_cast<std::uint32_t*>(
+                    g_moduleBase + kDynamicBlurParameterIndexRva);
+                if (parameterTable)
+                    blurAmount = *reinterpret_cast<float**>(parameterTable +
+                        sizeof(void*) * parameterIndex);
+                if (blurAmount)
+                {
+                    savedAmount = *blurAmount;
+                    *blurAmount = 0.0f;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                blurAmount = nullptr;
+            }
+        }
+        g_dynamicBlur(effect, view, input, output, a5, a6, a7, parameters);
+        if (blurAmount)
+        {
+            __try
+            {
+                *blurAmount = savedAmount;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
     }
 
     template<typename T>
@@ -1127,6 +1307,20 @@ float4 PSMain(VertexOutput input) : SV_Target
                 event.elementCount = elementCount;
                 event.callerRva = caller >= g_moduleBase && caller < g_moduleBase + kImageSize
                     ? caller - g_moduleBase : 0;
+                void* frames[12]{};
+                const USHORT frameCount = CaptureStackBackTrace(1,
+                    static_cast<DWORD>(std::size(frames)), frames, nullptr);
+                for (USHORT frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+                {
+                    const auto address = reinterpret_cast<std::uintptr_t>(frames[frameIndex]);
+                    if (address < g_moduleBase || address >= g_moduleBase + kImageSize)
+                        continue;
+                    const std::uintptr_t rva = address - g_moduleBase;
+                    if (rva >= 0x0025F000 && rva < 0x00261000)
+                        continue;
+                    event.parentCallerRva = rva;
+                    break;
+                }
                 UINT viewportCount = 1;
                 D3D11_VIEWPORT viewport{};
                 context->RSGetViewports(&viewportCount, &viewport);
@@ -1152,9 +1346,10 @@ float4 PSMain(VertexOutput input) : SV_Target
     }
 
     bool IsHudLayerDraw(ID3D11DeviceContext* context, std::uintptr_t caller,
-        ID3D11RenderTargetView* target) noexcept
+        ID3D11RenderTargetView* target, bool guiCapture) noexcept
     {
-        if (g_hudCompositeWidth <= 0.0f || g_hudCompositeHeight <= 0.0f || !target ||
+        if ((!guiCapture && (g_hudCompositeWidth <= 0.0f ||
+                g_hudCompositeHeight <= 0.0f)) || !target ||
             (caller != g_moduleBase + 0x002601C2 && caller != g_moduleBase + 0x0026038E))
             return false;
         ApiEvent targetDescription{};
@@ -1186,9 +1381,10 @@ float4 PSMain(VertexOutput input) : SV_Target
     }
 
     bool IsInventoryLayerDraw(ID3D11DeviceContext* context, std::uintptr_t caller,
-        ID3D11RenderTargetView* target) noexcept
+        ID3D11RenderTargetView* target, bool guiCapture) noexcept
     {
-        if (g_hudCompositeWidth <= 0.0f || g_hudCompositeHeight <= 0.0f || !target ||
+        if ((!guiCapture && (g_hudCompositeWidth <= 0.0f ||
+                g_hudCompositeHeight <= 0.0f)) || !target ||
             caller != g_moduleBase + 0x002600DD)
             return false;
 
@@ -1261,6 +1457,52 @@ float4 PSMain(VertexOutput input) : SV_Target
         return true;
     }
 
+    bool EnsureGuiLayer(const D3D11_TEXTURE2D_DESC& source) noexcept
+    {
+        if (!g_d3dDevice)
+            return false;
+        std::scoped_lock lock(g_guiLayerMutex);
+        if (g_guiLayerTarget && g_guiLayerWidth == source.Width &&
+            g_guiLayerHeight == source.Height && g_guiLayerSamples.Count ==
+            source.SampleDesc.Count && g_guiLayerSamples.Quality == source.SampleDesc.Quality)
+            return true;
+        if (g_guiLayerTarget && static_cast<std::uint64_t>(source.Width) * source.Height <
+            static_cast<std::uint64_t>(g_guiLayerWidth) * g_guiLayerHeight)
+            return false;
+
+        g_guiLayerView.Reset();
+        g_guiLayerResolved.Reset();
+        g_guiLayerTarget.Reset();
+        g_guiLayerTexture.Reset();
+        D3D11_TEXTURE2D_DESC description{};
+        description.Width = source.Width;
+        description.Height = source.Height;
+        description.MipLevels = 1;
+        description.ArraySize = 1;
+        description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        description.SampleDesc = source.SampleDesc;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (FAILED(g_d3dDevice->CreateTexture2D(&description, nullptr, &g_guiLayerTexture)) ||
+            FAILED(g_d3dDevice->CreateRenderTargetView(g_guiLayerTexture.Get(), nullptr,
+                &g_guiLayerTarget)))
+            return false;
+        description.SampleDesc = {1, 0};
+        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g_d3dDevice->CreateTexture2D(&description, nullptr, &g_guiLayerResolved)) ||
+            FAILED(g_d3dDevice->CreateShaderResourceView(g_guiLayerResolved.Get(), nullptr,
+                &g_guiLayerView)))
+            return false;
+        g_guiLayerWidth = source.Width;
+        g_guiLayerHeight = source.Height;
+        g_guiNativeWidth = source.Width;
+        g_guiNativeHeight = source.Height;
+        g_guiLayerSamples = source.SampleDesc;
+        g_guiLayerNeedsClear = true;
+        g_guiLayerLogged = false;
+        return true;
+    }
+
     struct HudRedirectState
     {
         Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
@@ -1275,8 +1517,11 @@ float4 PSMain(VertexOutput input) : SV_Target
         context->OMGetRenderTargets(1, &target, &depth);
         original.target.Attach(target);
         original.depth.Attach(depth);
-        if (indexed ? !IsInventoryLayerDraw(context, caller, target) :
-                !IsHudLayerDraw(context, caller, target))
+        const bool guiCandidate = indexed ? caller == g_moduleBase + 0x002600DD :
+            (caller == g_moduleBase + 0x002601C2 || caller == g_moduleBase + 0x0026038E);
+        const bool guiCapture = g_guiQuadEnabled && guiCandidate && IsGuiCursorModeActive();
+        if (indexed ? !IsInventoryLayerDraw(context, caller, target, guiCapture) :
+                !IsHudLayerDraw(context, caller, target, guiCapture))
             return false;
         Microsoft::WRL::ComPtr<ID3D11Resource> resource;
         target->GetResource(&resource);
@@ -1285,6 +1530,29 @@ float4 PSMain(VertexOutput input) : SV_Target
             return false;
         D3D11_TEXTURE2D_DESC description{};
         texture->GetDesc(&description);
+        if (guiCapture)
+        {
+            if (!EnsureGuiLayer(description))
+                return false;
+            if (g_guiLayerNeedsClear.exchange(false))
+            {
+                constexpr FLOAT transparent[4]{};
+                g_clearRtv(context, g_guiLayerTarget.Get(), transparent);
+            }
+            ID3D11RenderTargetView* guiTarget = g_guiLayerTarget.Get();
+            g_omSetRenderTargets(context, 1, &guiTarget,
+                indexed ? original.depth.Get() : nullptr);
+            g_guiLayerDirty = true;
+            if (!g_guiLayerLogged.exchange(true))
+            {
+                std::ostringstream message;
+                message << "World-locked GUI capture active: " << description.Width << 'x'
+                    << description.Height << " samples=" << description.SampleDesc.Count;
+                logging::Info(message.str());
+            }
+            return true;
+        }
+
         if (!EnsureHudLayer(description))
             return false;
         if (g_hudLayerNeedsClear.exchange(false))
@@ -1548,14 +1816,24 @@ float4 PSMain(VertexOutput input) : SV_Target
         g_previousHmdYaw = yaw;
         g_previousHmdPitch = pitch;
 
-        // Do not accumulate head movement while an inventory/menu cursor is up;
-        // resuming gameplay must not produce a sudden camera jump.
-        if (!g_gameWindow || GetForegroundWindow() != g_gameWindow ||
-            IsGuiCursorModeActive())
+        if (!g_gameWindow || GetForegroundWindow() != g_gameWindow)
             return;
 
         g_pendingMouseX += static_cast<double>(yawDelta) * g_hmdMouseYawScale;
         g_pendingMouseY += static_cast<double>(pitchDelta) * g_hmdMousePitchScale;
+        if (IsGuiCursorModeActive())
+        {
+            // DayZ blocks gameplay mouse-look while the inventory owns input.
+            // Keep the deltas queued; the render camera follows HMD directly
+            // meanwhile, and the game camera catches up when inventory closes.
+            if (!g_inventoryHmdLookEnabled ||
+                !g_inventoryPreviewActive.load(std::memory_order_relaxed))
+            {
+                g_pendingMouseX = 0.0;
+                g_pendingMouseY = 0.0;
+            }
+            return;
+        }
         const LONG mouseX = static_cast<LONG>(std::trunc(g_pendingMouseX));
         const LONG mouseY = static_cast<LONG>(std::trunc(g_pendingMouseY));
         g_pendingMouseX -= mouseX;
@@ -1798,10 +2076,11 @@ float4 PSMain(VertexOutput input) : SV_Target
         }
     }
 
-    HudCompositeConstants CurrentHudCompositeConstants() noexcept
+    HudCompositeConstants CurrentHudCompositeConstants(float contentScale = -1.0f) noexcept
     {
         HudCompositeConstants constants{};
-        constants.contentScale = (std::clamp)(g_hudContentScale, 0.05f, 4.0f);
+        constants.contentScale = contentScale > 0.0f ? contentScale :
+            (std::clamp)(g_hudContentScale, 0.05f, 4.0f);
         const float nativeWidth = static_cast<float>(g_guiNativeWidth.load());
         const float nativeHeight = static_cast<float>(g_guiNativeHeight.load());
         constants.cursorPixelUv[0] = nativeWidth > 0.0f ? 1.0f / nativeWidth : 1.0f;
@@ -1968,6 +2247,67 @@ float4 PSMain(VertexOutput input) : SV_Target
             }
         }
     }
+
+    bool RenderGuiQuadLayer(ID3D11RenderTargetView* target, std::uint32_t width,
+        std::uint32_t height) noexcept
+    {
+        if (!target || !width || !height)
+            return false;
+        std::scoped_lock lock(g_guiLayerMutex);
+        if (!g_guiLayerTexture || !g_guiLayerResolved || !g_guiLayerView ||
+            !EnsureHudCompositePipeline())
+            return false;
+
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> immediate;
+        g_d3dDevice->GetImmediateContext(&immediate);
+        if (!immediate)
+            return false;
+        if (g_guiLayerDirty.exchange(false))
+        {
+            if (g_guiLayerSamples.Count > 1)
+                immediate->ResolveSubresource(g_guiLayerResolved.Get(), 0,
+                    g_guiLayerTexture.Get(), 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+            else
+                immediate->CopyResource(g_guiLayerResolved.Get(), g_guiLayerTexture.Get());
+            constexpr FLOAT transparent[4]{};
+            immediate->ClearRenderTargetView(g_guiLayerTarget.Get(), transparent);
+            g_guiLayerNeedsClear = false;
+        }
+
+        g_hudCompositeContext->ClearState();
+        constexpr FLOAT transparent[4]{};
+        g_hudCompositeContext->ClearRenderTargetView(target, transparent);
+        g_hudCompositeContext->OMSetRenderTargets(1, &target, nullptr);
+        const D3D11_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(width),
+            static_cast<float>(height), 0.0f, 1.0f};
+        g_hudCompositeContext->RSSetViewports(1, &viewport);
+        g_hudCompositeContext->RSSetState(g_hudCompositeRasterizer.Get());
+        g_hudCompositeContext->OMSetDepthStencilState(g_hudCompositeDepth.Get(), 0);
+        constexpr FLOAT blendFactor[4]{};
+        g_hudCompositeContext->OMSetBlendState(g_hudCompositeBlend.Get(), blendFactor,
+            0xFFFFFFFFu);
+        g_hudCompositeContext->IASetInputLayout(nullptr);
+        g_hudCompositeContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_hudCompositeContext->VSSetShader(g_hudCompositeVs.Get(), nullptr, 0);
+        g_hudCompositeContext->PSSetShader(g_hudCompositePs.Get(), nullptr, 0);
+        const HudCompositeConstants constants = CurrentHudCompositeConstants(1.0f);
+        g_hudCompositeContext->UpdateSubresource(g_hudCompositeConstants.Get(), 0, nullptr,
+            &constants, 0, 0);
+        ID3D11ShaderResourceView* view = g_guiLayerView.Get();
+        ID3D11SamplerState* sampler = g_hudCompositeSampler.Get();
+        ID3D11Buffer* constantBuffer = g_hudCompositeConstants.Get();
+        g_hudCompositeContext->PSSetShaderResources(0, 1, &view);
+        g_hudCompositeContext->PSSetSamplers(0, 1, &sampler);
+        g_hudCompositeContext->PSSetConstantBuffers(0, 1, &constantBuffer);
+        g_hudCompositeContext->Draw(3, 0);
+        view = nullptr;
+        g_hudCompositeContext->PSSetShaderResources(0, 1, &view);
+        Microsoft::WRL::ComPtr<ID3D11CommandList> commands;
+        if (FAILED(g_hudCompositeContext->FinishCommandList(FALSE, &commands)) || !commands)
+            return false;
+        immediate->ExecuteCommandList(commands.Get(), TRUE);
+        return true;
+    }
 }
 
 namespace dayz::runtime_probe
@@ -2003,6 +2343,11 @@ namespace dayz::runtime_probe
         g_hudRightOffsetX = ReadFloat(L"stereo", L"hud_right_offset_x", 0.0f);
         g_guiMouseRemapEnabled = ReadBoolean(L"stereo", L"gui_mouse_remap", true);
         g_guiCursorEnabled = ReadBoolean(L"stereo", L"gui_cursor", true);
+        g_guiQuadEnabled = ReadBoolean(L"gui", L"quad_enabled", true);
+        g_inventoryHmdLookEnabled = ReadBoolean(L"gui", L"inventory_hmd_look", true);
+        g_inventoryBlurEnabled = ReadBoolean(L"gui", L"inventory_blur_enabled", false);
+        g_inventoryPreviewRotationScale = ReadFloat(L"gui",
+            L"inventory_preview_rotation_scale", 0.5f);
         const float imageShift = ReadFloat(L"stereo", L"image_shift", 0.0f);
         dayz::stereo_state::SetImageShift(imageShift);
         const std::wstring fitModeText = ReadString(L"stereo", L"fit_mode", L"contain");
@@ -2042,6 +2387,14 @@ namespace dayz::runtime_probe
             logging::Error("DayZ stereo runtime probe hook creation failed; hooks remain disabled");
             return false;
         }
+        bool dynamicBlurHookCreated{};
+        if (!g_inventoryBlurEnabled && kDynamicBlurRva && kDynamicBlurParameterIndexRva)
+        {
+            dynamicBlurHookCreated = AddHook(kDynamicBlurRva, HookedDynamicBlur,
+                g_dynamicBlur);
+            if (!dynamicBlurHookCreated)
+                logging::Error("Inventory blur hook creation failed; blur remains enabled");
+        }
         const std::array<void*, 6> targets{
             reinterpret_cast<void*>(g_moduleBase + kPrepareViewRva),
             reinterpret_cast<void*>(g_moduleBase + kExecuteViewRva),
@@ -2057,6 +2410,15 @@ namespace dayz::runtime_probe
                 logging::Error("DayZ stereo runtime probe hook enable failed; hooks disabled");
                 return false;
             }
+        if (dynamicBlurHookCreated)
+        {
+            const MH_STATUS enabled = MH_EnableHook(
+                reinterpret_cast<void*>(g_moduleBase + kDynamicBlurRva));
+            if (enabled == MH_OK || enabled == MH_ERROR_ENABLED)
+                logging::Info("Inventory Gauss blur disabled by [gui] setting");
+            else
+                logging::Error("Inventory blur hook could not be enabled; blur remains enabled");
+        }
         if (frameRefreshHookCreated)
         {
             const MH_STATUS enabled = MH_EnableHook(
@@ -2108,7 +2470,12 @@ namespace dayz::runtime_probe
                 << g_hudCompositeHeight << " hud_eye_offsets=" << g_hudLeftOffsetX << ','
                 << g_hudRightOffsetX << " hud_content_scale=" << g_hudContentScale
                 << " gui_mouse_remap=" << g_guiMouseRemapEnabled
-                << " gui_cursor=" << g_guiCursorEnabled;
+                << " gui_cursor=" << g_guiCursorEnabled
+                << " inventory_hmd_look=" << g_inventoryHmdLookEnabled
+                << " inventory_blur=" << g_inventoryBlurEnabled
+                << " inventory_preview_rotation_scale=" <<
+                    g_inventoryPreviewRotationScale
+                << " gui_quad=" << g_guiQuadEnabled;
             logging::Info(message.str());
         }
         return true;
@@ -2134,6 +2501,8 @@ namespace dayz::runtime_probe
         if (!g_active.load(std::memory_order_relaxed))
             return;
         UpdateNativeHmdAim();
+        if (!IsGuiCursorModeActive())
+            ResetInventoryPreviewAnchor();
         const std::uint64_t frame = g_presentCount.fetch_add(1) + 1;
         if (g_overrideHudScale)
             WriteHudScale();
@@ -2199,11 +2568,23 @@ namespace dayz::runtime_probe
                  << event.viewportWidth << 'x' << event.viewportHeight
                  << " depthEnabled=" << event.depthEnabled << " depthWrite=" << event.depthWrite
                  << " count=" << event.elementCount << " caller=DayZ+0x" << std::hex
-                 << event.callerRva;
+                 << event.callerRva << " parent=DayZ+0x" << event.parentCallerRva;
             logging::Info(line.str());
         }
         if (drawStateCount > g_drawStateEvents.size())
             logging::Info("  alpha draw-state trace truncated");
+    }
+
+    bool IsGuiQuadVisible() noexcept
+    {
+        return g_active.load(std::memory_order_relaxed) && g_guiQuadEnabled &&
+            IsGuiCursorModeActive() && g_guiLayerView;
+    }
+
+    bool RenderGuiQuad(ID3D11RenderTargetView* target, std::uint32_t width,
+        std::uint32_t height) noexcept
+    {
+        return IsGuiQuadVisible() && RenderGuiQuadLayer(target, width, height);
     }
 
     bool IsActive() noexcept

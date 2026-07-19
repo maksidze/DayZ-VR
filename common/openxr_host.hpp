@@ -43,6 +43,15 @@ private:
         std::vector<Microsoft::WRL::ComPtr<ID3D11RenderTargetView>> rtvs;
     };
 
+    struct GuiSwapchain
+    {
+        XrSwapchain handle{XR_NULL_HANDLE};
+        std::uint32_t width{};
+        std::uint32_t height{};
+        std::vector<XrSwapchainImageD3D11KHR> images;
+        std::vector<Microsoft::WRL::ComPtr<ID3D11RenderTargetView>> rtvs;
+    };
+
     bool CreateInstanceAndSystem();
     bool CreateCompatibleDevice();
     bool ValidateDevice(ID3D11Device* device);
@@ -50,8 +59,10 @@ private:
     bool CreateSession();
     bool CreateSpaces();
     bool CreateSwapchains();
+    bool CreateGuiSwapchain(const std::vector<std::int64_t>& formats);
     void PollEvents();
     void RenderFrame();
+    void AnchorGuiQuad(const XrPosef& headPose) noexcept;
     bool Check(XrResult result, const char* operation) const noexcept;
 
     mutable std::mutex mutex_;
@@ -68,7 +79,16 @@ private:
     std::unique_ptr<IFrameSource> debugFrameSource_;
     std::unique_ptr<IFrameSource> gameFrameSource_;
     std::array<EyeSwapchain, 2> eyeSwapchains_{};
+    GuiSwapchain guiSwapchain_{};
     std::array<XrView, 2> views_{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    XrPosef guiQuadPose_{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.25f}};
+    float guiQuadWidthMeters_{1.4f};
+    float guiQuadDistance_{1.25f};
+    float guiQuadVerticalOffset_{-0.1f};
+    bool guiQuadEnabled_{true};
+    bool guiQuadAnchored_{};
+    bool guiQuadWasVisible_{};
+    bool guiQuadHasImage_{};
     bool initialized_{};
     bool sessionRunning_{};
     bool shouldExit_{};

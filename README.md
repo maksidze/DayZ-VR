@@ -26,6 +26,10 @@ Support for `DayZDiag_x64.exe` is based on static signature relocation and shoul
 
 The system cursor is deliberately locked to the center of the game window while GUI cursor mode is active. Mouse movement updates a separate virtual cursor in DayZ's GUI coordinate space. This custom cursor remains aligned when the GUI is resized and is drawn into the VR-visible interface layer; the normal desktop cursor is therefore not used for interaction.
 
+Main-menu and inventory rendering is captured separately from the normal in-game HUD and submitted as a world-locked OpenXR quad. The quad is anchored in front of the HMD whenever cursor-driven GUI mode opens; closing it leaves the existing gameplay HUD path unchanged. Its texture resolution, physical width, distance, and vertical offset are configurable in the `[gui]` section of `dayz_openxr.ini`.
+
+The same section contains `inventory_hmd_look`, which keeps visual HMD look active while DayZ owns mouse input for the in-game inventory; `inventory_preview_rotation_scale`, which tunes character/item preview compensation; and `inventory_blur_enabled`, which can suppress DayZ's Gauss blur only while the inventory character-preview camera is active.
+
 The solution also includes `xr_probe.exe`, a standalone OpenXR/D3D11 diagnostic application. It can verify the active OpenXR runtime and headset before the proxy is loaded into DayZ.
 
 ## Current limitations
