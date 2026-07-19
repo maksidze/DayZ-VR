@@ -141,11 +141,13 @@ namespace
         }
     }
 
-    void SendMouseButton(bool down) noexcept
+    void SendMouseButton(bool right, bool down) noexcept
     {
         INPUT input{};
         input.type = INPUT_MOUSE;
-        input.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+        input.mi.dwFlags = right ?
+            (down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP) :
+            (down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP);
         SendInput(1, &input, sizeof(input));
     }
 
@@ -343,6 +345,8 @@ bool OpenXrHost::CreateControllerActions()
             aimPoseAction_) ||
         !createAction("trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT,
             triggerAction_) ||
+        !createAction("grab", "Grab", XR_ACTION_TYPE_FLOAT_INPUT,
+            grabAction_) ||
         !createAction("x_button", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT,
             xButtonAction_) ||
         !createAction("y_button", "Inventory", XR_ACTION_TYPE_BOOLEAN_INPUT,
@@ -377,6 +381,9 @@ bool OpenXrHost::CreateControllerActions()
         {aimPoseAction_, path("/user/hand/left/input/aim/pose")},
         {aimPoseAction_, path("/user/hand/right/input/aim/pose")},
         {triggerAction_, path("/user/hand/right/input/trigger/value")},
+        {triggerAction_, path("/user/hand/left/input/trigger/value")},
+        {grabAction_, path("/user/hand/left/input/squeeze/value")},
+        {grabAction_, path("/user/hand/right/input/squeeze/value")},
         {xButtonAction_, path("/user/hand/left/input/x/click")},
         {yButtonAction_, path("/user/hand/left/input/y/click")},
         {aButtonAction_, path("/user/hand/right/input/a/click")},
@@ -389,6 +396,9 @@ bool OpenXrHost::CreateControllerActions()
         {aimPoseAction_, path("/user/hand/left/input/aim/pose")},
         {aimPoseAction_, path("/user/hand/right/input/aim/pose")},
         {triggerAction_, path("/user/hand/right/input/trigger/value")},
+        {triggerAction_, path("/user/hand/left/input/trigger/value")},
+        {grabAction_, path("/user/hand/left/input/squeeze/value")},
+        {grabAction_, path("/user/hand/right/input/squeeze/value")},
         {xButtonAction_, path("/user/hand/left/input/a/click")},
         {yButtonAction_, path("/user/hand/left/input/b/click")},
         {aButtonAction_, path("/user/hand/right/input/a/click")},
@@ -402,6 +412,9 @@ bool OpenXrHost::CreateControllerActions()
             {aimPoseAction_, path("/user/hand/left/input/aim/pose")},
             {aimPoseAction_, path("/user/hand/right/input/aim/pose")},
             {triggerAction_, path("/user/hand/right/input/trigger/value")},
+            {triggerAction_, path("/user/hand/left/input/trigger/value")},
+            {grabAction_, path("/user/hand/left/input/squeeze/value")},
+            {grabAction_, path("/user/hand/right/input/squeeze/value")},
             {xButtonAction_, path("/user/hand/left/input/x/click")},
             {yButtonAction_, path("/user/hand/left/input/y/click")},
             {aButtonAction_, path("/user/hand/right/input/a/click")},
@@ -813,30 +826,60 @@ void OpenXrHost::ReleaseControllerKeys() noexcept
             SendKey(keys[index], false);
             movementKeys_[index] = false;
         }
-    if (triggerDown_)
+    if (leftMouseDown_)
     {
-        SendMouseButton(false);
-        triggerDown_ = false;
+        SendMouseButton(false, false);
+        leftMouseDown_ = false;
     }
-    if (xButtonDown_)
+    if (rightMouseDown_)
+    {
+        SendMouseButton(true, false);
+        rightMouseDown_ = false;
+    }
+    if (xKeyDown_)
+    {
+        SendKey('C', false);
+        xKeyDown_ = false;
+    }
+    if (yKeyDown_)
+    {
+        SendKey('R', false);
+        yKeyDown_ = false;
+    }
+    if (escapeKeyDown_)
     {
         SendKey(VK_ESCAPE, false);
-        xButtonDown_ = false;
+        escapeKeyDown_ = false;
     }
-    if (yButtonDown_)
+    if (tabKeyDown_)
     {
         SendKey(VK_TAB, false);
-        yButtonDown_ = false;
+        tabKeyDown_ = false;
+    }
+    if (rightGrabDown_)
+    {
+        SendKey('F', false);
+        rightGrabDown_ = false;
     }
     if (aButtonDown_)
     {
-        SendKey('F', false);
+        SendKey(VK_SHIFT, false);
         aButtonDown_ = false;
     }
     if (bButtonDown_)
     {
         SendKey(VK_SPACE, false);
         bButtonDown_ = false;
+    }
+    if (hotbarPreviousDown_)
+    {
+        SendKey(hotbarPreviousKey_, false);
+        hotbarPreviousDown_ = false;
+    }
+    if (hotbarNextDown_)
+    {
+        SendKey(hotbarNextKey_, false);
+        hotbarNextDown_ = false;
     }
 }
 
@@ -911,44 +954,94 @@ void OpenXrHost::SyncControllerInput(XrTime displayTime, bool guiVisible)
     const XrActionStateBoolean yState = booleanState(yButtonAction_, 0);
     const XrActionStateBoolean aState = booleanState(aButtonAction_, 1);
     const XrActionStateBoolean bState = booleanState(bButtonAction_, 1);
+    const auto floatState = [&](XrAction action, std::size_t hand) {
+        XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+        get.action = action;
+        get.subactionPath = handPaths_[hand];
+        xrGetActionStateFloat(session_, &get, &state);
+        return state;
+    };
+    const XrActionStateFloat leftGrabState = floatState(grabAction_, 0);
+    const XrActionStateFloat rightGrabState = floatState(grabAction_, 1);
+    const XrActionStateFloat leftTriggerState = floatState(triggerAction_, 0);
+    const XrActionStateFloat rightTriggerState = floatState(triggerAction_, 1);
     const bool xDown = xState.isActive && xState.currentState;
     const bool yDown = yState.isActive && yState.currentState;
-    if (xDown != xButtonDown_)
-    {
-        SendKey(VK_ESCAPE, xDown);
-        logging::Info(xDown ? "controller X -> Escape down" :
-            "controller X -> Escape up");
-    }
-    if (yDown != yButtonDown_)
-    {
-        SendKey(VK_TAB, yDown);
-        logging::Info(yDown ? "controller Y -> Tab down" :
-            "controller Y -> Tab up");
-    }
-    xButtonDown_ = xDown;
-    yButtonDown_ = yDown;
-
+    const bool leftGrabDown = leftGrabState.isActive && leftGrabState.currentState > 0.55f;
+    const bool rightGrabDown = rightGrabState.isActive && rightGrabState.currentState > 0.55f;
     const bool aDown = aState.isActive && aState.currentState;
     const bool bDown = bState.isActive && bState.currentState;
-    if (aDown != aButtonDown_)
+    const auto updateKey = [&](WORD key, bool desired, bool& current,
+        const char* downMessage, const char* upMessage) {
+        if (desired == current)
+            return;
+        SendKey(key, desired);
+        logging::Info(desired ? downMessage : upMessage);
+        current = desired;
+    };
+    updateKey('C', xDown && !leftGrabDown, xKeyDown_,
+        "controller X -> C down", "controller X -> C up");
+    updateKey(VK_ESCAPE, xDown && leftGrabDown, escapeKeyDown_,
+        "controller LGRAB+X -> Escape down", "controller LGRAB+X -> Escape up");
+    updateKey('R', yDown && !leftGrabDown, yKeyDown_,
+        "controller Y -> R down", "controller Y -> R up");
+    updateKey(VK_TAB, yDown && leftGrabDown, tabKeyDown_,
+        "controller LGRAB+Y -> Tab down", "controller LGRAB+Y -> Tab up");
+    updateKey('F', rightGrabDown, rightGrabDown_,
+        "controller RGRAB -> F down", "controller RGRAB -> F up");
+    updateKey(VK_SHIFT, aDown && !leftGrabDown, aButtonDown_,
+        "controller A -> Shift down", "controller A -> Shift up");
+    updateKey(VK_SPACE, bDown && !leftGrabDown, bButtonDown_,
+        "controller B -> Space down", "controller B -> Space up");
+    const auto hotbarVirtualKey = [](unsigned slot) -> WORD {
+        return slot == 10 ? '0' : static_cast<WORD>('0' + slot);
+    };
+    const auto updateHotbar = [&](bool desired, bool& current, WORD& activeKey,
+        int direction, const char* name) {
+        if (desired == current)
+            return;
+        if (desired)
+        {
+            if (direction < 0)
+                hotbarSlot_ = hotbarSlot_ == 1 ? 10 : hotbarSlot_ - 1;
+            else
+                hotbarSlot_ = hotbarSlot_ == 10 ? 1 : hotbarSlot_ + 1;
+            activeKey = hotbarVirtualKey(hotbarSlot_);
+            SendKey(activeKey, true);
+            std::ostringstream message;
+            message << name << " -> hotbar slot " << hotbarSlot_ << " down";
+            logging::Info(message.str());
+        }
+        else
+        {
+            SendKey(activeKey, false);
+            std::ostringstream message;
+            message << name << " -> hotbar slot " << hotbarSlot_ << " up";
+            logging::Info(message.str());
+        }
+        current = desired;
+    };
+    updateHotbar(leftGrabDown && aDown, hotbarPreviousDown_, hotbarPreviousKey_, -1,
+        "controller LGRAB+A");
+    updateHotbar(leftGrabDown && bDown, hotbarNextDown_, hotbarNextKey_, 1,
+        "controller LGRAB+B");
+
+    const bool desiredLeftMouse = rightTriggerState.isActive &&
+        rightTriggerState.currentState > 0.55f;
+    if (desiredLeftMouse != leftMouseDown_)
     {
-        SendKey('F', aDown);
-        logging::Info(aDown ? "controller A -> F down" : "controller A -> F up");
-        aButtonDown_ = aDown;
+        SendMouseButton(false, desiredLeftMouse);
+        leftMouseDown_ = desiredLeftMouse;
     }
-    if (bDown != bButtonDown_)
+    const bool desiredRightMouse = leftTriggerState.isActive &&
+        leftTriggerState.currentState > 0.55f;
+    if (desiredRightMouse != rightMouseDown_)
     {
-        SendKey(VK_SPACE, bDown);
-        logging::Info(bDown ? "controller B -> Space down" :
-            "controller B -> Space up");
-        bButtonDown_ = bDown;
+        SendMouseButton(true, desiredRightMouse);
+        rightMouseDown_ = desiredRightMouse;
     }
 
-    XrActionStateFloat trigger{XR_TYPE_ACTION_STATE_FLOAT};
-    XrActionStateGetInfo triggerGet{XR_TYPE_ACTION_STATE_GET_INFO};
-    triggerGet.action = triggerAction_;
-    triggerGet.subactionPath = handPaths_[1];
-    xrGetActionStateFloat(session_, &triggerGet, &trigger);
     bool cursorHit{};
     guiRayValid_ = guiVisible &&
         (aimLocations_[1].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
@@ -987,13 +1080,6 @@ void OpenXrHost::SyncControllerInput(XrTime displayTime, bool guiVisible)
             }
         }
     }
-    const bool desiredTrigger = guiVisible && cursorHit && trigger.isActive &&
-        trigger.currentState > 0.55f;
-    if (desiredTrigger != triggerDown_)
-    {
-        SendMouseButton(desiredTrigger);
-        triggerDown_ = desiredTrigger;
-    }
     static std::uint64_t inputLogCounter{};
     if (++inputLogCounter % 180 == 0)
     {
@@ -1004,7 +1090,11 @@ void OpenXrHost::SyncControllerInput(XrTime displayTime, bool guiVisible)
             << " Y=" << yDown << "(active=" << yState.isActive << ')'
             << " A=" << aDown << "(active=" << aState.isActive << ')'
             << " B=" << bDown << "(active=" << bState.isActive << ')'
-            << " trigger=" << trigger.currentState << " gui_hit=" << cursorHit;
+            << " LGrab=" << leftGrabState.currentState
+            << " RGrab=" << rightGrabState.currentState
+            << " LTrigger=" << leftTriggerState.currentState
+            << " RTrigger=" << rightTriggerState.currentState
+            << " gui_hit=" << cursorHit;
         if (guiRayValid_)
         {
             const XrVector3f aimForward = Rotate(aimLocations_[1].pose.orientation,
@@ -1255,7 +1345,7 @@ void OpenXrHost::RenderFrame()
                 rayLayer.size = {currentGuiRayLength_, guiRayThickness_};
             }
         }
-        if (directionRaysEnabled_ && !guiVisible && axisLayerCount + 8 <= axisLayers.size())
+        if (directionRaysEnabled_ && !guiVisible && axisLayerCount + 6 <= axisLayers.size())
         {
             const XrVector3f origin{
                 (views_[0].pose.position.x + views_[1].pose.position.x) * 0.5f,
@@ -1263,24 +1353,18 @@ void OpenXrHost::RenderFrame()
                 (views_[0].pose.position.z + views_[1].pose.position.z) * 0.5f};
             const XrVector3f hmdForward = Rotate(views_[0].pose.orientation,
                 {0.0f, 0.0f, -1.0f});
-            XrVector3f controllerForward = hmdForward;
-            XrVector3f controllerOrigin = origin;
-            if ((aimLocations_[1].locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0)
-                controllerForward = Rotate(aimLocations_[1].pose.orientation,
-                    {0.0f, 0.0f, -1.0f});
-            if ((aimLocations_[1].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0)
-                controllerOrigin = aimLocations_[1].pose.position;
             const dayz::stereo_state::CameraDirections cameraDirections =
                 dayz::stereo_state::GetCameraDirections();
             const XrVector3f nativeForward{cameraDirections.nativeX,
                 cameraDirections.nativeY, cameraDirections.nativeZ};
             const XrVector3f renderForward{cameraDirections.renderX,
                 cameraDirections.renderY, cameraDirections.renderZ};
-            const XrVector3f directions[4]{hmdForward, controllerForward,
+            // The right-controller ray is a GUI pointer only. Keep the gameplay
+            // diagnostics limited to HMD, native DayZ aim, and render-camera aim.
+            const XrVector3f directions[3]{hmdForward,
                 cameraDirections.valid ? nativeForward : hmdForward,
                 cameraDirections.valid ? renderForward : hmdForward};
-            const XrVector3f origins[4]{origin, controllerOrigin, origin, origin};
-            const std::int32_t colorPixels[4]{4, 5, 6, 7};
+            const std::int32_t colorPixels[3]{4, 6, 7};
             const XrQuaternionf crossTurn{s, 0.0f, 0.0f, s};
             for (std::size_t ray = 0; ray < std::size(directions); ++ray)
             {
@@ -1296,9 +1380,9 @@ void OpenXrHost::RenderFrame()
                     rayLayer.subImage.swapchain = axisSwapchain_.handle;
                     rayLayer.subImage.imageRect.offset = {colorPixels[ray], 0};
                     rayLayer.subImage.imageRect.extent = {1, 1};
-                    rayLayer.pose.position = {origins[ray].x + directions[ray].x *
-                        directionRayLength_ * 0.5f, origins[ray].y + directions[ray].y *
-                        directionRayLength_ * 0.5f, origins[ray].z + directions[ray].z *
+                    rayLayer.pose.position = {origin.x + directions[ray].x *
+                        directionRayLength_ * 0.5f, origin.y + directions[ray].y *
+                        directionRayLength_ * 0.5f, origin.z + directions[ray].z *
                         directionRayLength_ * 0.5f};
                     rayLayer.pose.orientation = orientation;
                     rayLayer.size = {directionRayLength_, directionRayThickness_};

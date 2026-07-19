@@ -30,7 +30,29 @@ Main-menu and inventory rendering is captured separately from the normal in-game
 
 The same section contains `inventory_hmd_look`, which keeps visual HMD look active while DayZ owns mouse input for the in-game inventory; `inventory_preview_rotation_scale`, which tunes only the character-preview compensation (item previews remain on the GUI path); and `inventory_blur_enabled`, which can suppress DayZ's Gauss blur only while the inventory character-preview camera is active.
 
-`inventory_player_preview_visible=false` hides the inventory character preview without changing the item panels. The `[controls]` section enables tracked-controller input and diagnostic XYZ axes. Touch uses left X for Escape/menu, left Y for Tab/inventory, the left stick for WASD, the right stick for horizontal camera turn, and the right trigger as the GUI left mouse button. The right aim pose drives the virtual cursor by ray-intersecting the world-locked GUI quad. `hmd_position_scale` in `[stereo]` controls physical HMD translation applied to the DayZ camera. OpenXR always submits the headset's native FOV. `game_fov` is an absolute gameplay FOV in radians that replaces DayZ's loaded `fov` value only in memory; the user's `.DayZProfile` is never written. Set it to `0` to disable the override.
+`inventory_player_preview_visible=false` hides the inventory character preview without changing the item panels. The `[controls]` section enables tracked-controller input and diagnostic XYZ axes. The right aim pose drives the virtual cursor by ray-intersecting the world-locked GUI quad. This pointer ray is displayed only while the main menu or inventory is visible. `hmd_position_scale` in `[stereo]` controls physical HMD translation applied to the DayZ camera. OpenXR always submits the headset's native FOV. `game_fov` is an absolute gameplay FOV in radians that replaces DayZ's loaded `fov` value only in memory; the user's `.DayZProfile` is never written. Set it to `0` to disable the override.
+
+## Controller mapping
+
+Controller buttons mirror their emulated keyboard or mouse state: the emulated input goes down when the controller input goes down and is released when the controller input is released. `LGRAB` acts as a modifier for the left face buttons.
+
+| Controller input | DayZ input |
+| --- | --- |
+| Left stick | `W`, `A`, `S`, `D` |
+| Right stick, horizontal | Mouse horizontal turn |
+| `X` | `C` |
+| `Y` | `R` |
+| `LGRAB + X` | `Esc` (menu) |
+| `LGRAB + Y` | `Tab` (inventory) |
+| `LGRAB + A` | Previous quickbar slot (`1` through `0`, cyclic) |
+| `LGRAB + B` | Next quickbar slot (`1` through `0`, cyclic) |
+| `RGRAB` | `F` |
+| `A` without `LGRAB` | `Shift` |
+| `B` without `LGRAB` | `Space` |
+| Left trigger | Right mouse button |
+| Right trigger | Left mouse button |
+
+The quickbar cycle is maintained by the mod and emits the corresponding number key. Selecting a slot directly on the physical keyboard does not currently resynchronize the mod's cycle position.
 
 The solution also includes `xr_probe.exe`, a standalone OpenXR/D3D11 diagnostic application. It can verify the active OpenXR runtime and headset before the proxy is loaded into DayZ.
 

@@ -1704,12 +1704,15 @@ float4 PSMain(VertexOutput input) : SV_Target
     bool IsInventoryLayerDraw(ID3D11DeviceContext* context, std::uintptr_t caller,
         ID3D11RenderTargetView* target, bool guiCapture) noexcept
     {
-        // Automatic hud_scale compositing applies only to the in-game HUD. Inventory
-        // capture is kept on its dedicated GUI quad path so a cursor debounce frame
-        // cannot leak inventory draws back into the gameplay layer.
+        // The same indexed GUI path is used for both inventory objects and the 3D
+        // hotbar icons. Capture it into the scaled HUD only while the GUI cursor is
+        // genuinely hidden. Raw cursor state excludes the inventory immediately,
+        // including the first frame before the debounced GUI-quad state activates.
         const bool explicitComposite =
             g_hudCompositeWidth > 0.0f && g_hudCompositeHeight > 0.0f;
-        if ((!guiCapture && !explicitComposite) || !target ||
+        const bool scaledGameplayHud = g_overrideHudScale && g_hudScale < 0.999f &&
+            !RawGuiCursorModeActive();
+        if ((!guiCapture && !explicitComposite && !scaledGameplayHud) || !target ||
             caller != g_moduleBase + 0x002600DD)
             return false;
 
@@ -1892,7 +1895,9 @@ float4 PSMain(VertexOutput input) : SV_Target
             indexed ? original.depth.Get() : nullptr);
         g_hudLayerDirty = true;
         if (indexed && !g_inventoryLayerLogged.exchange(true))
-            logging::Info("Inventory DrawIndexed redirected into HUD composite layer");
+            logging::Info(guiCapture ?
+                "Inventory DrawIndexed redirected into world-locked GUI layer" :
+                "3D hotbar DrawIndexed redirected into scaled HUD layer");
         if (!g_hudLayerLogged.exchange(true))
         {
             std::ostringstream message;
