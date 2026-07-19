@@ -113,6 +113,8 @@ namespace
     std::array<Event, kEventCapacity> g_events{};
     std::atomic_uint32_t g_eventCount{};
     std::atomic_uint64_t g_presentCount{};
+    std::atomic_uint g_guiCursorVisibleFrames{};
+    std::atomic_bool g_guiCursorDebounced{};
     std::atomic_bool g_active{};
     std::atomic_bool g_attempted{};
     std::uintptr_t g_moduleBase{};
@@ -263,6 +265,7 @@ namespace
     std::atomic_bool g_guiLayerDirty{};
     std::atomic_bool g_guiLayerNeedsClear{true};
     std::atomic_bool g_guiLayerLogged{};
+    std::atomic_uint64_t g_guiLayerCapturedPresent{~std::uint64_t{}};
     bool g_guiMouseRemapEnabled{true};
     bool g_guiCursorEnabled{true};
     HWND g_gameWindow{};
@@ -280,6 +283,7 @@ namespace
     std::atomic_bool g_guiVirtualCursorActive{};
     std::atomic_bool g_guiVirtualCursorApiLogged{};
 
+    bool RawGuiCursorModeActive() noexcept;
     bool IsGuiCursorModeActive() noexcept;
 
     struct HudCompositeConstants
@@ -344,8 +348,8 @@ float4 PSMain(VertexOutput input) : SV_Target
     Vec3 g_lastStereoTranslation{};
     bool g_haveStereoTranslation{};
     dayz::stereo_state::HmdPosition g_hmdPositionCenter{};
+    Quaternion g_hmdPositionOrientationCenter{0.0f, 0.0f, 0.0f, 1.0f};
     bool g_haveHmdPositionCenter{};
-    CameraBasis g_hmdPositionAnchorBasis{};
     std::atomic_uint64_t g_stereoApplyCount{};
     Quaternion g_hmdCenter{0.0f, 0.0f, 0.0f, 1.0f};
     bool g_haveHmdCenter{};
@@ -356,8 +360,14 @@ float4 PSMain(VertexOutput input) : SV_Target
     CameraBasis g_baseCameraBasis{};
     CameraBasis g_lastAppliedCameraBasis{};
     bool g_haveAppliedCameraBasis{};
+    void* g_directionCalibrationCamera{};
+    CameraBasis g_directionCalibrationBasis{};
+    Quaternion g_directionCalibrationXr{0.0f, 0.0f, 0.0f, 1.0f};
+    bool g_haveDirectionCalibration{};
     std::atomic_uint64_t g_hmdApplyCount{};
     Quaternion g_inventoryPreviewHmdCenter{0.0f, 0.0f, 0.0f, 1.0f};
+    Quaternion g_guiLookHmdCenter{0.0f, 0.0f, 0.0f, 1.0f};
+    bool g_haveGuiLookCenter{};
     OpaqueCamera* g_inventoryPreviewCamera{};
     CameraBasis g_inventoryPreviewBaseBasis{};
     CameraBasis g_inventoryPreviewLastBasis{};
@@ -460,7 +470,8 @@ float4 PSMain(VertexOutput input) : SV_Target
     bool ApplyHudSafeArea(void* renderer, int* appliedWidth = nullptr,
         int* appliedHeight = nullptr) noexcept
     {
-        if (!renderer || g_hudSafeWidth <= 0.0f || g_hudSafeHeight <= 0.0f)
+        const bool overrideSafeArea = g_hudSafeWidth > 0.0f && g_hudSafeHeight > 0.0f;
+        if (!renderer || (!g_overrideHudScale && !overrideSafeArea))
             return false;
         __try
         {
@@ -472,10 +483,40 @@ float4 PSMain(VertexOutput input) : SV_Target
             const int height = reinterpret_cast<DimensionFn>(table[976 / sizeof(void*)])(renderer);
             if (width <= 0 || height <= 0)
                 return false;
-            const float safeWidth = (std::clamp)(g_hudSafeWidth / width, 0.05f, 1.0f);
-            const float safeHeight = (std::clamp)(g_hudSafeHeight / height, 0.05f, 1.0f);
-            const float left = (1.0f - safeWidth) * 0.5f;
-            const float top = (1.0f - safeHeight) * 0.5f;
+
+            float contentWidth = 1.0f;
+            float contentHeight = 1.0f;
+            if (g_overrideHudScale)
+            {
+                const float scale = (std::clamp)(g_hudScale, 0.05f, 1.0f);
+                // Match DayZ's native IGUIScale layout calculation. At wide aspect ratios
+                // the vertical extent is the requested scale and the horizontal extent is
+                // reduced so GUI coordinates retain their intended 4:3 aspect.
+                const float aspectCorrection =
+                    (static_cast<float>(width) / static_cast<float>(height)) * 0.75f;
+                if (aspectCorrection < 1.0f)
+                {
+                    contentWidth = scale;
+                    contentHeight = scale * aspectCorrection;
+                }
+                else
+                {
+                    contentWidth = scale / aspectCorrection;
+                    contentHeight = scale;
+                }
+            }
+            if (overrideSafeArea)
+            {
+                const float safeWidth =
+                    (std::clamp)(g_hudSafeWidth / static_cast<float>(width), 0.05f, 1.0f);
+                const float safeHeight =
+                    (std::clamp)(g_hudSafeHeight / static_cast<float>(height), 0.05f, 1.0f);
+                contentWidth = (std::min)(contentWidth, safeWidth);
+                contentHeight = (std::min)(contentHeight, safeHeight);
+            }
+
+            const float left = (1.0f - contentWidth) * 0.5f;
+            const float top = (1.0f - contentHeight) * 0.5f;
             auto* values = reinterpret_cast<float*>(renderer);
             values[30] = left;
             values[31] = top;
@@ -513,9 +554,13 @@ float4 PSMain(VertexOutput input) : SV_Target
         if (!ApplyHudSafeArea(renderer, &width, &height) || g_hudSafeLogged.exchange(true))
             return;
         std::ostringstream message;
-        message << "HUD safe area forced every frame: target=" << g_hudSafeWidth << 'x'
-            << g_hudSafeHeight << " framebuffer=" << width << 'x' << height
-            << " renderer=" << renderer;
+        const auto* values = reinterpret_cast<const float*>(renderer);
+        message << "HUD layout forced every frame: scale="
+            << (g_overrideHudScale ? g_hudScale : 1.0f)
+            << " safe_limit=" << g_hudSafeWidth << 'x' << g_hudSafeHeight
+            << " framebuffer=" << width << 'x' << height
+            << " rect=" << values[30] << ',' << values[31] << '-'
+            << values[32] << ',' << values[33] << " renderer=" << renderer;
         logging::Info(message.str());
     }
 
@@ -721,13 +766,16 @@ float4 PSMain(VertexOutput input) : SV_Target
             ? caller - g_moduleBase : 0;
     }
 
-    void ApplyAlternateEye(OpaqueContext* context) noexcept
+    Quaternion Normalize(Quaternion value) noexcept;
+    Quaternion Multiply(const Quaternion& a, const Quaternion& b) noexcept;
+    Vec3 Rotate(const Quaternion& q, const Vec3& value) noexcept;
+
+    void ApplyAlternateEye(OpaqueCamera* camera) noexcept
     {
         const dayz::stereo_state::EyePositions eyePositions =
             dayz::stereo_state::GetEyePositions();
         if (!g_alternateEyeEnabled || !eyePositions.valid)
             return;
-        OpaqueCamera* camera = ReadField<OpaqueCamera*>(context, kContextCamera);
         if (!camera)
             return;
         const auto cameraAddress = reinterpret_cast<std::uintptr_t>(camera);
@@ -771,19 +819,38 @@ float4 PSMain(VertexOutput input) : SV_Target
             if (!g_haveHmdPositionCenter)
             {
                 g_hmdPositionCenter = hmdPosition;
-                g_hmdPositionAnchorBasis = {right, up, forward};
+                const dayz::stereo_state::HmdOrientation centerOrientation =
+                    dayz::stereo_state::GetHmdOrientation();
+                if (centerOrientation.valid)
+                    g_hmdPositionOrientationCenter = Normalize({centerOrientation.x,
+                        centerOrientation.y, centerOrientation.z, centerOrientation.w});
                 g_haveHmdPositionCenter = true;
             }
             const float dx = (hmdPosition.x - g_hmdPositionCenter.x) * g_hmdPositionScale;
             const float dy = (hmdPosition.y - g_hmdPositionCenter.y) * g_hmdPositionScale;
             const float dz = (hmdPosition.z - g_hmdPositionCenter.z) * g_hmdPositionScale;
-            const Vec3 anchorRight = normalizeAxis(g_hmdPositionAnchorBasis.right);
-            const Vec3 anchorUp = normalizeAxis(g_hmdPositionAnchorBasis.up);
-            const Vec3 anchorForward = normalizeAxis(g_hmdPositionAnchorBasis.forward);
+            Vec3 trackingDelta{dx, dy, dz};
+            const dayz::stereo_state::HmdOrientation currentOrientation =
+                dayz::stereo_state::GetHmdOrientation();
+            if (currentOrientation.valid)
+            {
+                const Quaternion currentHmd = Normalize({currentOrientation.x,
+                    currentOrientation.y, currentOrientation.z, currentOrientation.w});
+                const Quaternion inverseCenter{-g_hmdPositionOrientationCenter.x,
+                    -g_hmdPositionOrientationCenter.y, -g_hmdPositionOrientationCenter.z,
+                    g_hmdPositionOrientationCenter.w};
+                const Quaternion relativeHmd = Normalize(Multiply(inverseCenter, currentHmd));
+                const Quaternion inverseRelative{-relativeHmd.x, -relativeHmd.y,
+                    -relativeHmd.z, relativeHmd.w};
+                trackingDelta = Rotate(inverseRelative, trackingDelta);
+            }
             positionalOffset = {
-                anchorRight.x * dx + anchorUp.x * dy - anchorForward.x * dz,
-                anchorRight.y * dx + anchorUp.y * dy - anchorForward.y * dz,
-                anchorRight.z * dx + anchorUp.z * dy - anchorForward.z * dz};
+                rightUnit.x * trackingDelta.x + upUnit.x * trackingDelta.y -
+                    forwardUnit.x * trackingDelta.z,
+                rightUnit.y * trackingDelta.x + upUnit.y * trackingDelta.y -
+                    forwardUnit.y * trackingDelta.z,
+                rightUnit.z * trackingDelta.x + upUnit.z * trackingDelta.y -
+                    forwardUnit.z * trackingDelta.z};
         }
         const Vec3 translated{
             g_baseTranslation.x + right.x * offset + positionalOffset.x,
@@ -792,17 +859,25 @@ float4 PSMain(VertexOutput input) : SV_Target
         __try
         {
             *reinterpret_cast<Vec3*>(cameraAddress + 0x2C) = translated;
+            const Vec3 verified = *reinterpret_cast<Vec3*>(cameraAddress + 0x2C);
+            g_lastStereoTranslation = verified;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             return;
         }
         g_lastStereoCamera = camera;
-        g_lastStereoTranslation = translated;
         g_haveStereoTranslation = true;
         const std::uint64_t application = g_stereoApplyCount.fetch_add(1) + 1;
         if (application % 120 == 0)
-            LogStereoApplication(eye, offset);
+        {
+            char message[320]{};
+            sprintf_s(message, "Alternating eye camera verified eye=%u offset=%.6f base=(%.4f,%.4f,%.4f) written=(%.4f,%.4f,%.4f)",
+                eye, offset, g_baseTranslation.x, g_baseTranslation.y, g_baseTranslation.z,
+                g_lastStereoTranslation.x, g_lastStereoTranslation.y,
+                g_lastStereoTranslation.z);
+            logging::Info(message);
+        }
     }
 
     Quaternion Normalize(Quaternion value) noexcept
@@ -865,6 +940,24 @@ float4 PSMain(VertexOutput input) : SV_Target
         return {value.x * factor, value.y * factor, value.z * factor};
     }
 
+    float Dot(const Vec3& a, const Vec3& b) noexcept
+    {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    Vec3 DirectionToOpenXr(const Vec3& direction) noexcept
+    {
+        const Vec3 right = Divide(g_directionCalibrationBasis.right,
+            VectorLength(g_directionCalibrationBasis.right));
+        const Vec3 up = Divide(g_directionCalibrationBasis.up,
+            VectorLength(g_directionCalibrationBasis.up));
+        const Vec3 forward = Divide(g_directionCalibrationBasis.forward,
+            VectorLength(g_directionCalibrationBasis.forward));
+        const Vec3 unit = Divide(direction, VectorLength(direction));
+        return Rotate(g_directionCalibrationXr,
+            {Dot(unit, right), Dot(unit, up), -Dot(unit, forward)});
+    }
+
     Vec3 MapOpenXrVectorToCamera(const CameraBasis& base, const Vec3& value) noexcept
     {
         return {
@@ -899,6 +992,23 @@ float4 PSMain(VertexOutput input) : SV_Target
             g_hmdCenter.w};
         const Quaternion relative = Normalize(Multiply(inverseCenter, current));
         Quaternion renderRotation = relative;
+        const bool guiLook = g_inventoryHmdLookEnabled && IsGuiCursorModeActive();
+        if (guiLook)
+        {
+            if (!g_haveGuiLookCenter)
+            {
+                g_guiLookHmdCenter = current;
+                g_haveGuiLookCenter = true;
+                logging::Info("GUI HMD-look center captured; primary camera unlocked");
+            }
+            const Quaternion inverseGuiCenter{-g_guiLookHmdCenter.x,
+                -g_guiLookHmdCenter.y, -g_guiLookHmdCenter.z, g_guiLookHmdCenter.w};
+            renderRotation = Normalize(Multiply(inverseGuiCenter, current));
+        }
+        else
+        {
+            g_haveGuiLookCenter = false;
+        }
         const bool inventoryLook = g_inventoryHmdLookEnabled &&
             g_inventoryPreviewActive.load(std::memory_order_relaxed) &&
             g_haveInventoryPreviewCenter;
@@ -909,7 +1019,7 @@ float4 PSMain(VertexOutput input) : SV_Target
                 g_inventoryPreviewHmdCenter.w};
             renderRotation = Normalize(Multiply(inverseInventoryCenter, current));
         }
-        else if (g_hmdNativeAimEnabled)
+        else if (g_hmdNativeAimEnabled && !guiLook)
         {
             // DayZ receives HMD yaw/pitch through its native mouse path so all
             // gameplay systems share them. Only roll remains a render-space
@@ -935,6 +1045,13 @@ float4 PSMain(VertexOutput input) : SV_Target
         if (!g_haveAppliedCameraBasis || g_lastHmdCamera != camera ||
             BasisDistance(gameBasis, g_lastAppliedCameraBasis) > 0.0001f)
             g_baseCameraBasis = gameBasis;
+        if (!g_haveDirectionCalibration || g_directionCalibrationCamera != camera)
+        {
+            g_directionCalibrationCamera = camera;
+            g_directionCalibrationBasis = g_baseCameraBasis;
+            g_directionCalibrationXr = current;
+            g_haveDirectionCalibration = true;
+        }
 
         const Vec3 xrRight = Rotate(renderRotation, {1.0f, 0.0f, 0.0f});
         const Vec3 xrUp = Rotate(renderRotation, {0.0f, 1.0f, 0.0f});
@@ -954,6 +1071,10 @@ float4 PSMain(VertexOutput input) : SV_Target
             Scale(MapOpenXrVectorToCamera(unitBasis, xrRight), rightScale),
             Scale(MapOpenXrVectorToCamera(unitBasis, xrUp), upScale),
             Scale(MapOpenXrVectorToCamera(unitBasis, xrForward), forwardScale)};
+        const Vec3 nativeDirection = DirectionToOpenXr(g_baseCameraBasis.forward);
+        const Vec3 renderDirection = DirectionToOpenXr(rotated.forward);
+        dayz::stereo_state::UpdateCameraDirections(nativeDirection.x, nativeDirection.y,
+            nativeDirection.z, renderDirection.x, renderDirection.y, renderDirection.z);
         __try
         {
             *reinterpret_cast<Vec3*>(address + 0x08) = rotated.right;
@@ -970,10 +1091,38 @@ float4 PSMain(VertexOutput input) : SV_Target
         const std::uint64_t application = g_hmdApplyCount.fetch_add(1) + 1;
         if (application % 120 == 0)
         {
-            char message[256]{};
-            sprintf_s(message, "HMD camera rotation applied relative=(%.4f,%.4f,%.4f,%.4f) basis_delta=%.5f",
+            float activeTransform[12]{};
+            bool haveActiveTransform{};
+            if (kCameraManagerRva && kGetActiveCameraStateRva)
+            {
+                __try
+                {
+                    using GetActiveCameraStateFn = std::uintptr_t(__fastcall*)(std::uintptr_t);
+                    const auto getActive = reinterpret_cast<GetActiveCameraStateFn>(
+                        g_moduleBase + kGetActiveCameraStateRva);
+                    const std::uintptr_t state = getActive(g_moduleBase + kCameraManagerRva);
+                    if (state)
+                    {
+                        const float* transform = reinterpret_cast<const float*>(state + 24);
+                        for (unsigned index = 0; index < 12; ++index)
+                            activeTransform[index] = transform[index];
+                        haveActiveTransform = true;
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                }
+            }
+            char message[1024]{};
+            sprintf_s(message, "direction probe hmd_relative_q=(%.4f,%.4f,%.4f,%.4f) dayz_native_xr=(%.4f,%.4f,%.4f) dayz_render_xr=(%.4f,%.4f,%.4f) basis_delta=%.5f active_state_3x4=%s[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]",
                 relative.x, relative.y, relative.z, relative.w,
-                BasisDistance(g_baseCameraBasis, rotated));
+                nativeDirection.x, nativeDirection.y, nativeDirection.z,
+                renderDirection.x, renderDirection.y, renderDirection.z,
+                BasisDistance(g_baseCameraBasis, rotated),
+                haveActiveTransform ? "" : "unavailable",
+                activeTransform[0], activeTransform[1], activeTransform[2], activeTransform[3],
+                activeTransform[4], activeTransform[5], activeTransform[6], activeTransform[7],
+                activeTransform[8], activeTransform[9], activeTransform[10], activeTransform[11]);
             logging::Info(message);
         }
     }
@@ -1085,7 +1234,10 @@ float4 PSMain(VertexOutput input) : SV_Target
         const bool primaryProjectionCamera = g_projectionRefreshDepth != 0 &&
             camera == g_projectionContextCamera;
         if (primaryProjectionCamera)
+        {
             ApplyHmdRotationToCamera(camera);
+            ApplyAlternateEye(camera);
+        }
         const std::uintptr_t result = g_frameRefresh(camera, engine, rebuild);
         return result;
     }
@@ -1226,7 +1378,7 @@ float4 PSMain(VertexOutput input) : SV_Target
         ApplyProfileFovOverride();
         ApplyActiveCameraFovOverride();
         EnsureCameraRefreshHook(context);
-        ApplyAlternateEye(context);
+        ApplyAlternateEye(ReadField<OpaqueCamera*>(context, kContextCamera));
         Record(EventKind::Projection, context, mode);
         OpaqueCamera* previousProjectionCamera = g_projectionContextCamera;
         g_projectionContextCamera = ReadField<OpaqueCamera*>(context, kContextCamera);
@@ -1243,6 +1395,10 @@ float4 PSMain(VertexOutput input) : SV_Target
     char __fastcall HookedHudLayout(void* renderer)
     {
         const char result = g_hudLayout(renderer);
+        // The native layout routine recalculates and overwrites IGUIScale, so apply both
+        // the global value and its dependent safe-area rectangle only after it returns.
+        if (g_overrideHudScale)
+            WriteHudScale();
         ApplyHudSafeArea(renderer);
         return result;
     }
@@ -1511,8 +1667,10 @@ float4 PSMain(VertexOutput input) : SV_Target
     bool IsHudLayerDraw(ID3D11DeviceContext* context, std::uintptr_t caller,
         ID3D11RenderTargetView* target, bool guiCapture) noexcept
     {
-        if ((!guiCapture && (g_hudCompositeWidth <= 0.0f ||
-                g_hudCompositeHeight <= 0.0f)) || !target ||
+        const bool explicitComposite =
+            g_hudCompositeWidth > 0.0f && g_hudCompositeHeight > 0.0f;
+        const bool scaledComposite = g_overrideHudScale && g_hudScale < 0.999f;
+        if ((!guiCapture && !explicitComposite && !scaledComposite) || !target ||
             (caller != g_moduleBase + 0x002601C2 && caller != g_moduleBase + 0x0026038E))
             return false;
         ApiEvent targetDescription{};
@@ -1546,8 +1704,12 @@ float4 PSMain(VertexOutput input) : SV_Target
     bool IsInventoryLayerDraw(ID3D11DeviceContext* context, std::uintptr_t caller,
         ID3D11RenderTargetView* target, bool guiCapture) noexcept
     {
-        if ((!guiCapture && (g_hudCompositeWidth <= 0.0f ||
-                g_hudCompositeHeight <= 0.0f)) || !target ||
+        // Automatic hud_scale compositing applies only to the in-game HUD. Inventory
+        // capture is kept on its dedicated GUI quad path so a cursor debounce frame
+        // cannot leak inventory draws back into the gameplay layer.
+        const bool explicitComposite =
+            g_hudCompositeWidth > 0.0f && g_hudCompositeHeight > 0.0f;
+        if ((!guiCapture && !explicitComposite) || !target ||
             caller != g_moduleBase + 0x002600DD)
             return false;
 
@@ -1706,6 +1868,8 @@ float4 PSMain(VertexOutput input) : SV_Target
             g_omSetRenderTargets(context, 1, &guiTarget,
                 indexed ? original.depth.Get() : nullptr);
             g_guiLayerDirty = true;
+            g_guiLayerCapturedPresent.store(g_presentCount.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
             if (!g_guiLayerLogged.exchange(true))
             {
                 std::ostringstream message;
@@ -1733,7 +1897,8 @@ float4 PSMain(VertexOutput input) : SV_Target
         {
             std::ostringstream message;
             message << "Native HUD layer active: " << description.Width << 'x'
-                << description.Height << " samples=" << description.SampleDesc.Count;
+                << description.Height << " samples=" << description.SampleDesc.Count
+                << " automatic_scale=" << (g_overrideHudScale ? g_hudScale : 1.0f);
             logging::Info(message.str());
         }
         return true;
@@ -1939,7 +2104,7 @@ float4 PSMain(VertexOutput input) : SV_Target
         return true;
     }
 
-    bool IsGuiCursorModeActive() noexcept
+    bool RawGuiCursorModeActive() noexcept
     {
         if (!g_guiMouseRemapEnabled || !g_gameWindow ||
             GetForegroundWindow() != g_gameWindow)
@@ -1947,6 +2112,12 @@ float4 PSMain(VertexOutput input) : SV_Target
         CURSORINFO info{sizeof(info)};
         const BOOL result = g_getCursorInfo ? g_getCursorInfo(&info) : GetCursorInfo(&info);
         return result && (info.flags & CURSOR_SHOWING) != 0;
+    }
+
+    bool IsGuiCursorModeActive() noexcept
+    {
+        return g_guiCursorDebounced.load(std::memory_order_relaxed) &&
+            RawGuiCursorModeActive();
     }
 
     void UpdateNativeHmdAim() noexcept
@@ -1989,8 +2160,7 @@ float4 PSMain(VertexOutput input) : SV_Target
             // DayZ blocks gameplay mouse-look while the inventory owns input.
             // Keep the deltas queued; the render camera follows HMD directly
             // meanwhile, and the game camera catches up when inventory closes.
-            if (!g_inventoryHmdLookEnabled ||
-                !g_inventoryPreviewActive.load(std::memory_order_relaxed))
+            if (!g_inventoryHmdLookEnabled)
             {
                 g_pendingMouseX = 0.0;
                 g_pendingMouseY = 0.0;
@@ -2364,9 +2534,17 @@ float4 PSMain(VertexOutput input) : SV_Target
                 g_hudLayerTexture.Get());
         ID3D11RenderTargetView* target = backTarget.Get();
         g_hudCompositeContext->OMSetRenderTargets(1, &target, nullptr);
-        const float width = (std::clamp)(g_hudCompositeWidth, 64.0f,
+        const bool explicitComposite =
+            g_hudCompositeWidth > 0.0f && g_hudCompositeHeight > 0.0f;
+        const float automaticScale =
+            (std::clamp)(g_overrideHudScale ? g_hudScale : 1.0f, 0.05f, 1.0f);
+        const float requestedWidth = explicitComposite ? g_hudCompositeWidth :
+            static_cast<float>(backDescription.Width) * automaticScale;
+        const float requestedHeight = explicitComposite ? g_hudCompositeHeight :
+            static_cast<float>(backDescription.Height) * automaticScale;
+        const float width = (std::clamp)(requestedWidth, 64.0f,
             static_cast<float>(backDescription.Width));
-        const float height = (std::clamp)(g_hudCompositeHeight, 64.0f,
+        const float height = (std::clamp)(requestedHeight, 64.0f,
             static_cast<float>(backDescription.Height));
         const unsigned hudEye = dayz::stereo_state::RenderedEye();
         const float eyeOffsetX = hudEye == 0 ? g_hudLeftOffsetX : g_hudRightOffsetX;
@@ -2687,6 +2865,17 @@ namespace dayz::runtime_probe
     {
         if (!g_active.load(std::memory_order_relaxed))
             return;
+        if (RawGuiCursorModeActive())
+        {
+            const unsigned visible = g_guiCursorVisibleFrames.fetch_add(1,
+                std::memory_order_relaxed) + 1;
+            g_guiCursorDebounced.store(visible >= 2, std::memory_order_relaxed);
+        }
+        else
+        {
+            g_guiCursorVisibleFrames.store(0, std::memory_order_relaxed);
+            g_guiCursorDebounced.store(false, std::memory_order_relaxed);
+        }
         ApplyProfileFovOverride();
         ApplyActiveCameraFovOverride();
         UpdateNativeHmdAim();
@@ -2769,7 +2958,9 @@ namespace dayz::runtime_probe
     bool IsGuiQuadVisible() noexcept
     {
         return g_active.load(std::memory_order_relaxed) && g_guiQuadEnabled &&
-            IsGuiCursorModeActive() && g_guiLayerView;
+            IsGuiCursorModeActive() && g_guiLayerView &&
+            g_guiLayerCapturedPresent.load(std::memory_order_relaxed) ==
+                g_presentCount.load(std::memory_order_relaxed);
     }
 
     void SetGuiVirtualCursorNormalized(float u, float v) noexcept

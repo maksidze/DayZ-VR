@@ -24,6 +24,16 @@ namespace dayz::stereo_state
         float z{};
         bool valid{};
     };
+    struct CameraDirections
+    {
+        float nativeX{};
+        float nativeY{};
+        float nativeZ{-1.0f};
+        float renderX{};
+        float renderY{};
+        float renderZ{-1.0f};
+        bool valid{};
+    };
 
     enum class FitMode : unsigned { Contain, Stretch, Cover };
     struct Presentation
@@ -40,6 +50,9 @@ namespace dayz::stereo_state
     HmdOrientation GetHmdOrientation() noexcept;
     void UpdateHmdPosition(float x, float y, float z) noexcept;
     HmdPosition GetHmdPosition() noexcept;
+    void UpdateCameraDirections(float nativeX, float nativeY, float nativeZ,
+        float renderX, float renderY, float renderZ) noexcept;
+    CameraDirections GetCameraDirections() noexcept;
     unsigned RenderedEye() noexcept;
     void AdvanceEye() noexcept;
     void SetImageShift(float shift) noexcept;

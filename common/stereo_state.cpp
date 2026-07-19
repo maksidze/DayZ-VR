@@ -11,6 +11,9 @@ namespace
     std::atomic_uint g_orientationSequence{};
     std::array<std::atomic<float>, 3> g_hmdPosition{};
     std::atomic_uint g_positionSequence{};
+    std::array<std::atomic<float>, 6> g_cameraDirections{{0.0f, 0.0f, -1.0f,
+        0.0f, 0.0f, -1.0f}};
+    std::atomic_uint g_cameraDirectionSequence{};
     std::atomic_uint g_eye{};
     std::atomic<float> g_imageShift{};
     std::atomic_uint g_fitMode{static_cast<unsigned>(dayz::stereo_state::FitMode::Contain)};
@@ -89,6 +92,39 @@ namespace dayz::stereo_state
             result.y = g_hmdPosition[1].load(std::memory_order_relaxed);
             result.z = g_hmdPosition[2].load(std::memory_order_relaxed);
             const unsigned after = g_positionSequence.load(std::memory_order_acquire);
+            if (before == after)
+            {
+                result.valid = after != 0;
+                return result;
+            }
+        }
+    }
+
+    void UpdateCameraDirections(float nativeX, float nativeY, float nativeZ,
+        float renderX, float renderY, float renderZ) noexcept
+    {
+        g_cameraDirectionSequence.fetch_add(1, std::memory_order_acq_rel);
+        const float values[]{nativeX, nativeY, nativeZ, renderX, renderY, renderZ};
+        for (std::size_t index = 0; index < std::size(values); ++index)
+            g_cameraDirections[index].store(values[index], std::memory_order_relaxed);
+        g_cameraDirectionSequence.fetch_add(1, std::memory_order_release);
+    }
+
+    CameraDirections GetCameraDirections() noexcept
+    {
+        CameraDirections result{};
+        for (;;)
+        {
+            const unsigned before = g_cameraDirectionSequence.load(std::memory_order_acquire);
+            if (before & 1u)
+                continue;
+            result.nativeX = g_cameraDirections[0].load(std::memory_order_relaxed);
+            result.nativeY = g_cameraDirections[1].load(std::memory_order_relaxed);
+            result.nativeZ = g_cameraDirections[2].load(std::memory_order_relaxed);
+            result.renderX = g_cameraDirections[3].load(std::memory_order_relaxed);
+            result.renderY = g_cameraDirections[4].load(std::memory_order_relaxed);
+            result.renderZ = g_cameraDirections[5].load(std::memory_order_relaxed);
+            const unsigned after = g_cameraDirectionSequence.load(std::memory_order_acquire);
             if (before == after)
             {
                 result.valid = after != 0;
