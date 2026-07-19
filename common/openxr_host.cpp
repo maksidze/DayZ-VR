@@ -81,6 +81,51 @@ namespace
         const float half = yaw * 0.5f;
         return {0.0f, std::sin(half), 0.0f, std::cos(half)};
     }
+
+    XrQuaternionf Multiply(const XrQuaternionf& a, const XrQuaternionf& b) noexcept
+    {
+        return {
+            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+    }
+
+    XrVector3f Rotate(const XrQuaternionf& q, const XrVector3f& v) noexcept
+    {
+        const XrQuaternionf p{v.x, v.y, v.z, 0.0f};
+        const XrQuaternionf inverse{-q.x, -q.y, -q.z, q.w};
+        const XrQuaternionf result = Multiply(Multiply(q, p), inverse);
+        return {result.x, result.y, result.z};
+    }
+
+    void SendKey(WORD key, bool down) noexcept
+    {
+        INPUT input{};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wScan = static_cast<WORD>(MapVirtualKeyW(key, MAPVK_VK_TO_VSC));
+        input.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP);
+        SendInput(1, &input, sizeof(input));
+    }
+
+    void SendMouseButton(bool down) noexcept
+    {
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+        SendInput(1, &input, sizeof(input));
+    }
+
+    void SendMouseTurn(LONG x) noexcept
+    {
+        if (!x)
+            return;
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dx = x;
+        input.mi.dwFlags = MOUSEEVENTF_MOVE;
+        SendInput(1, &input, sizeof(input));
+    }
 }
 
 OpenXrHost& OpenXrHost::Instance() noexcept
@@ -233,6 +278,123 @@ bool OpenXrHost::CreateSession()
     return Check(xrCreateSession(instance_, &sessionInfo, &session_), "xrCreateSession");
 }
 
+bool OpenXrHost::CreateControllerActions()
+{
+    if (!controllerInputEnabled_)
+        return true;
+    XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
+    strcpy_s(setInfo.actionSetName, "dayz_vr_controls");
+    strcpy_s(setInfo.localizedActionSetName, "DayZ VR Controls");
+    setInfo.priority = 0;
+    if (!Check(xrCreateActionSet(instance_, &setInfo, &actionSet_), "xrCreateActionSet"))
+        return false;
+    if (!Check(xrStringToPath(instance_, "/user/hand/left", &handPaths_[0]),
+            "xrStringToPath(left hand)") ||
+        !Check(xrStringToPath(instance_, "/user/hand/right", &handPaths_[1]),
+            "xrStringToPath(right hand)"))
+        return false;
+
+    const auto createAction = [&](const char* name, const char* localized,
+        XrActionType type, XrAction& action) {
+        XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+        strcpy_s(info.actionName, name);
+        strcpy_s(info.localizedActionName, localized);
+        info.actionType = type;
+        info.countSubactionPaths = static_cast<std::uint32_t>(handPaths_.size());
+        info.subactionPaths = handPaths_.data();
+        return Check(xrCreateAction(actionSet_, &info, &action), "xrCreateAction");
+    };
+    if (!createAction("grip_pose", "Grip Pose", XR_ACTION_TYPE_POSE_INPUT,
+            gripPoseAction_) ||
+        !createAction("aim_pose", "Aim Pose", XR_ACTION_TYPE_POSE_INPUT,
+            aimPoseAction_) ||
+        !createAction("trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT,
+            triggerAction_) ||
+        !createAction("x_button", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT,
+            xButtonAction_) ||
+        !createAction("y_button", "Inventory", XR_ACTION_TYPE_BOOLEAN_INPUT,
+            yButtonAction_) ||
+        !createAction("thumbstick", "Thumbstick", XR_ACTION_TYPE_VECTOR2F_INPUT,
+            thumbstickAction_))
+        return false;
+
+    const auto path = [&](const char* text) {
+        XrPath result{XR_NULL_PATH};
+        xrStringToPath(instance_, text, &result);
+        return result;
+    };
+    const auto suggest = [&](const char* profile,
+        const std::vector<XrActionSuggestedBinding>& bindings) {
+        XrInteractionProfileSuggestedBinding info{
+            XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        info.interactionProfile = path(profile);
+        info.countSuggestedBindings = static_cast<std::uint32_t>(bindings.size());
+        info.suggestedBindings = bindings.data();
+        const XrResult result = xrSuggestInteractionProfileBindings(instance_, &info);
+        if (XR_FAILED(result))
+            logging::XrError("xrSuggestInteractionProfileBindings", result);
+    };
+    suggest("/interaction_profiles/oculus/touch_controller", {
+        {gripPoseAction_, path("/user/hand/left/input/grip/pose")},
+        {gripPoseAction_, path("/user/hand/right/input/grip/pose")},
+        {aimPoseAction_, path("/user/hand/left/input/aim/pose")},
+        {aimPoseAction_, path("/user/hand/right/input/aim/pose")},
+        {triggerAction_, path("/user/hand/right/input/trigger/value")},
+        {xButtonAction_, path("/user/hand/left/input/x/click")},
+        {yButtonAction_, path("/user/hand/left/input/y/click")},
+        {thumbstickAction_, path("/user/hand/left/input/thumbstick")},
+        {thumbstickAction_, path("/user/hand/right/input/thumbstick")}});
+    suggest("/interaction_profiles/valve/index_controller", {
+        {gripPoseAction_, path("/user/hand/left/input/grip/pose")},
+        {gripPoseAction_, path("/user/hand/right/input/grip/pose")},
+        {aimPoseAction_, path("/user/hand/left/input/aim/pose")},
+        {aimPoseAction_, path("/user/hand/right/input/aim/pose")},
+        {triggerAction_, path("/user/hand/right/input/trigger/value")},
+        {xButtonAction_, path("/user/hand/left/input/a/click")},
+        {yButtonAction_, path("/user/hand/left/input/b/click")},
+        {thumbstickAction_, path("/user/hand/left/input/thumbstick")},
+        {thumbstickAction_, path("/user/hand/right/input/thumbstick")}});
+    const auto suggestXyController = [&](const char* profile) {
+        suggest(profile, {
+            {gripPoseAction_, path("/user/hand/left/input/grip/pose")},
+            {gripPoseAction_, path("/user/hand/right/input/grip/pose")},
+            {aimPoseAction_, path("/user/hand/left/input/aim/pose")},
+            {aimPoseAction_, path("/user/hand/right/input/aim/pose")},
+            {triggerAction_, path("/user/hand/right/input/trigger/value")},
+            {xButtonAction_, path("/user/hand/left/input/x/click")},
+            {yButtonAction_, path("/user/hand/left/input/y/click")},
+            {thumbstickAction_, path("/user/hand/left/input/thumbstick")},
+            {thumbstickAction_, path("/user/hand/right/input/thumbstick")}});
+    };
+    suggestXyController("/interaction_profiles/facebook/touch_controller_pro");
+    suggestXyController("/interaction_profiles/meta/touch_controller_plus");
+    suggestXyController("/interaction_profiles/bytedance/pico_neo3_controller");
+    suggestXyController("/interaction_profiles/htc/vive_cosmos_controller");
+    suggestXyController("/interaction_profiles/hp/mixed_reality_controller");
+
+    XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+    attach.countActionSets = 1;
+    attach.actionSets = &actionSet_;
+    if (!Check(xrAttachSessionActionSets(session_, &attach), "xrAttachSessionActionSets"))
+        return false;
+    for (std::size_t hand = 0; hand < handPaths_.size(); ++hand)
+    {
+        XrActionSpaceCreateInfo spaceInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+        spaceInfo.poseInActionSpace.orientation.w = 1.0f;
+        spaceInfo.subactionPath = handPaths_[hand];
+        spaceInfo.action = gripPoseAction_;
+        if (!Check(xrCreateActionSpace(session_, &spaceInfo, &gripSpaces_[hand]),
+                "xrCreateActionSpace(grip)"))
+            return false;
+        spaceInfo.action = aimPoseAction_;
+        if (!Check(xrCreateActionSpace(session_, &spaceInfo, &aimSpaces_[hand]),
+                "xrCreateActionSpace(aim)"))
+            return false;
+    }
+    logging::Info("OpenXR controller actions ready");
+    return true;
+}
+
 bool OpenXrHost::CreateSpaces()
 {
     XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
@@ -348,6 +510,11 @@ bool OpenXrHost::CreateSwapchains()
         logging::Error("GUI quad swapchain is unavailable; projection rendering will continue");
         guiQuadEnabled_ = false;
     }
+    if (controllerAxesEnabled_ && !CreateAxisSwapchain(formats))
+    {
+        logging::Error("Controller axis swapchain unavailable; controller input will continue");
+        controllerAxesEnabled_ = false;
+    }
     logging::Info("Stereo swapchains are ready");
     return true;
 }
@@ -412,6 +579,46 @@ bool OpenXrHost::CreateGuiSwapchain(const std::vector<std::int64_t>& formats)
     return true;
 }
 
+bool OpenXrHost::CreateAxisSwapchain(const std::vector<std::int64_t>& formats)
+{
+    if (!controllerAxesEnabled_)
+        return true;
+    const DXGI_FORMAT format = std::find(formats.begin(), formats.end(),
+        static_cast<std::int64_t>(DXGI_FORMAT_R8G8B8A8_UNORM)) != formats.end()
+        ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    if (std::find(formats.begin(), formats.end(), static_cast<std::int64_t>(format)) ==
+        formats.end())
+        return false;
+    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    info.format = format;
+    info.sampleCount = 1;
+    info.width = 3;
+    info.height = 1;
+    info.faceCount = 1;
+    info.arraySize = 1;
+    info.mipCount = 1;
+    if (!Check(xrCreateSwapchain(session_, &info, &axisSwapchain_.handle),
+            "xrCreateSwapchain(controller axes)"))
+        return false;
+    std::uint32_t count{};
+    if (!Check(xrEnumerateSwapchainImages(axisSwapchain_.handle, 0, &count, nullptr),
+            "xrEnumerateSwapchainImages(controller axes count)"))
+        return false;
+    axisSwapchain_.images.resize(count);
+    for (auto& image : axisSwapchain_.images)
+        image.type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+    if (!Check(xrEnumerateSwapchainImages(axisSwapchain_.handle, count, &count,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(axisSwapchain_.images.data())),
+            "xrEnumerateSwapchainImages(controller axes)"))
+        return false;
+    const std::uint32_t pixels[3]{0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u};
+    for (const auto& image : axisSwapchain_.images)
+        context_->UpdateSubresource(image.texture, 0, nullptr, pixels, sizeof(pixels), 0);
+    logging::Info("Controller XYZ axis swapchain ready");
+    return true;
+}
+
 bool OpenXrHost::FinishInitialization(ID3D11Device* device)
 {
     device_ = device;
@@ -423,9 +630,21 @@ bool OpenXrHost::FinishInitialization(ID3D11Device* device)
         0.4f, 5.0f);
     guiQuadVerticalOffset_ = (std::clamp)(ReadFloat(L"gui", L"quad_vertical_offset", -0.1f),
         -2.0f, 2.0f);
+    controllerInputEnabled_ = ReadBoolean(L"controls", L"enabled", true);
+    controllerAxesEnabled_ = ReadBoolean(L"controls", L"show_controller_axes", true);
+    controllerAxesEnabled_ = controllerAxesEnabled_ && controllerInputEnabled_;
+    controllerTurnScale_ = ReadFloat(L"controls", L"turn_scale", 18.0f);
+    controllerDeadzone_ = (std::clamp)(ReadFloat(L"controls", L"deadzone", 0.3f),
+        0.0f, 0.9f);
     logging::Info("Creating OpenXR session");
     if (!CreateSession())
         return false;
+    if (!CreateControllerActions())
+    {
+        logging::Error("OpenXR controller actions unavailable; headset rendering will continue");
+        controllerInputEnabled_ = false;
+        controllerAxesEnabled_ = false;
+    }
     logging::Info("Creating OpenXR reference spaces");
     if (!CreateSpaces())
         return false;
@@ -501,6 +720,7 @@ void OpenXrHost::PollEvents()
             }
             else if (sessionState_ == XR_SESSION_STATE_STOPPING && sessionRunning_)
             {
+                ReleaseControllerKeys();
                 Check(xrEndSession(session_), "xrEndSession");
                 sessionRunning_ = false;
             }
@@ -526,6 +746,168 @@ void OpenXrHost::AnchorGuiQuad(const XrPosef& headPose) noexcept
         headPose.position.z + forward.z * guiQuadDistance_};
     guiQuadAnchored_ = true;
     logging::Info("GUI quad anchored in LOCAL space");
+}
+
+void OpenXrHost::ReleaseControllerKeys() noexcept
+{
+    constexpr WORD keys[4]{'W', 'A', 'S', 'D'};
+    for (std::size_t index = 0; index < movementKeys_.size(); ++index)
+        if (movementKeys_[index])
+        {
+            SendKey(keys[index], false);
+            movementKeys_[index] = false;
+        }
+    if (triggerDown_)
+    {
+        SendMouseButton(false);
+        triggerDown_ = false;
+    }
+    if (xButtonDown_)
+    {
+        SendKey(VK_ESCAPE, false);
+        xButtonDown_ = false;
+    }
+    if (yButtonDown_)
+    {
+        SendKey(VK_TAB, false);
+        yButtonDown_ = false;
+    }
+}
+
+void OpenXrHost::SyncControllerInput(XrTime displayTime, bool guiVisible)
+{
+    if (!controllerInputEnabled_ || actionSet_ == XR_NULL_HANDLE)
+        return;
+    XrActiveActionSet active{actionSet_, XR_NULL_PATH};
+    XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+    sync.countActiveActionSets = 1;
+    sync.activeActionSets = &active;
+    if (!Check(xrSyncActions(session_, &sync), "xrSyncActions"))
+        return;
+    static XrPath loggedInteractionProfile{XR_NULL_PATH};
+    XrInteractionProfileState interaction{XR_TYPE_INTERACTION_PROFILE_STATE};
+    if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(session_, handPaths_[0], &interaction)) &&
+        interaction.interactionProfile != XR_NULL_PATH &&
+        interaction.interactionProfile != loggedInteractionProfile)
+    {
+        char profile[XR_MAX_PATH_LENGTH]{};
+        std::uint32_t length{};
+        if (XR_SUCCEEDED(xrPathToString(instance_, interaction.interactionProfile,
+                static_cast<std::uint32_t>(std::size(profile)), &length, profile)))
+        {
+            logging::Info(std::string("OpenXR left controller profile: ") + profile);
+            loggedInteractionProfile = interaction.interactionProfile;
+        }
+    }
+    for (std::size_t hand = 0; hand < handPaths_.size(); ++hand)
+    {
+        gripLocations_[hand] = {XR_TYPE_SPACE_LOCATION};
+        aimLocations_[hand] = {XR_TYPE_SPACE_LOCATION};
+        xrLocateSpace(gripSpaces_[hand], localSpace_, displayTime, &gripLocations_[hand]);
+        xrLocateSpace(aimSpaces_[hand], localSpace_, displayTime, &aimLocations_[hand]);
+    }
+#ifndef _WINDLL
+    (void)guiVisible;
+    return;
+#endif
+    const auto vectorState = [&](std::size_t hand) {
+        XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
+        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+        get.action = thumbstickAction_;
+        get.subactionPath = handPaths_[hand];
+        xrGetActionStateVector2f(session_, &get, &state);
+        return state.isActive ? state.currentState : XrVector2f{};
+    };
+    const XrVector2f leftStick = vectorState(0);
+    const XrVector2f rightStick = vectorState(1);
+    const bool desired[4]{leftStick.y > controllerDeadzone_,
+        leftStick.x < -controllerDeadzone_, leftStick.y < -controllerDeadzone_,
+        leftStick.x > controllerDeadzone_};
+    constexpr WORD keys[4]{'W', 'A', 'S', 'D'};
+    for (std::size_t index = 0; index < movementKeys_.size(); ++index)
+        if (movementKeys_[index] != desired[index])
+        {
+            SendKey(keys[index], desired[index]);
+            movementKeys_[index] = desired[index];
+        }
+    if (std::fabs(rightStick.x) > controllerDeadzone_)
+        SendMouseTurn(static_cast<LONG>(std::lround(rightStick.x * controllerTurnScale_)));
+
+    const auto booleanState = [&](XrAction action, std::size_t hand) {
+        XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+        get.action = action;
+        get.subactionPath = handPaths_[hand];
+        xrGetActionStateBoolean(session_, &get, &state);
+        return state;
+    };
+    const XrActionStateBoolean xState = booleanState(xButtonAction_, 0);
+    const XrActionStateBoolean yState = booleanState(yButtonAction_, 0);
+    const bool xDown = xState.isActive && xState.currentState;
+    const bool yDown = yState.isActive && yState.currentState;
+    if (xDown != xButtonDown_)
+        SendKey(VK_ESCAPE, xDown);
+    if (yDown != yButtonDown_)
+        SendKey(VK_TAB, yDown);
+    xButtonDown_ = xDown;
+    yButtonDown_ = yDown;
+
+    XrActionStateFloat trigger{XR_TYPE_ACTION_STATE_FLOAT};
+    XrActionStateGetInfo triggerGet{XR_TYPE_ACTION_STATE_GET_INFO};
+    triggerGet.action = triggerAction_;
+    triggerGet.subactionPath = handPaths_[1];
+    xrGetActionStateFloat(session_, &triggerGet, &trigger);
+    bool cursorHit{};
+    if (guiVisible && guiQuadAnchored_ &&
+        (aimLocations_[1].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+        (aimLocations_[1].locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
+    {
+        const XrPosef& aim = aimLocations_[1].pose;
+        const XrVector3f ray = Rotate(aim.orientation, {0.0f, 0.0f, -1.0f});
+        const XrQuaternionf inverse{-guiQuadPose_.orientation.x, -guiQuadPose_.orientation.y,
+            -guiQuadPose_.orientation.z, guiQuadPose_.orientation.w};
+        const XrVector3f relative{aim.position.x - guiQuadPose_.position.x,
+            aim.position.y - guiQuadPose_.position.y,
+            aim.position.z - guiQuadPose_.position.z};
+        const XrVector3f localOrigin = Rotate(inverse, relative);
+        const XrVector3f localDirection = Rotate(inverse, ray);
+        if (std::fabs(localDirection.z) > 0.00001f)
+        {
+            const float distance = -localOrigin.z / localDirection.z;
+            const float height = guiQuadWidthMeters_ *
+                static_cast<float>(guiSwapchain_.height) /
+                static_cast<float>((std::max)(1u, guiSwapchain_.width));
+            const float x = localOrigin.x + localDirection.x * distance;
+            const float y = localOrigin.y + localDirection.y * distance;
+            if (distance > 0.0f && std::fabs(x) <= guiQuadWidthMeters_ * 0.5f &&
+                std::fabs(y) <= height * 0.5f)
+            {
+                cursorHit = true;
+#ifdef _WINDLL
+                dayz::runtime_probe::SetGuiVirtualCursorNormalized(
+                    x / guiQuadWidthMeters_ + 0.5f, 0.5f - y / height);
+#endif
+            }
+        }
+    }
+    const bool desiredTrigger = guiVisible && cursorHit && trigger.isActive &&
+        trigger.currentState > 0.55f;
+    if (desiredTrigger != triggerDown_)
+    {
+        SendMouseButton(desiredTrigger);
+        triggerDown_ = desiredTrigger;
+    }
+    static std::uint64_t inputLogCounter{};
+    if (++inputLogCounter % 180 == 0)
+    {
+        std::ostringstream message;
+        message << "controller input left=" << leftStick.x << ',' << leftStick.y
+            << " right=" << rightStick.x << ',' << rightStick.y
+            << " X=" << xDown << "(active=" << xState.isActive << ')'
+            << " Y=" << yDown << "(active=" << yState.isActive << ')'
+            << " trigger=" << trigger.currentState << " gui_hit=" << cursorHit;
+        logging::Info(message.str());
+    }
 }
 
 void OpenXrHost::RenderFrame()
@@ -561,9 +943,16 @@ void OpenXrHost::RenderFrame()
         dayz::stereo_state::UpdateEyePositions(
             views_[0].pose.position.x, views_[0].pose.position.y, views_[0].pose.position.z,
             views_[1].pose.position.x, views_[1].pose.position.y, views_[1].pose.position.z);
+        dayz::stereo_state::UpdateHmdPosition(
+            (views_[0].pose.position.x + views_[1].pose.position.x) * 0.5f,
+            (views_[0].pose.position.y + views_[1].pose.position.y) * 0.5f,
+            (views_[0].pose.position.z + views_[1].pose.position.z) * 0.5f);
         const auto& orientation = views_[0].pose.orientation;
         dayz::stereo_state::UpdateHmdOrientation(orientation.x, orientation.y,
             orientation.z, orientation.w);
+        if (guiVisible && (!guiQuadWasVisible_ || !guiQuadAnchored_))
+            AnchorGuiQuad(views_[0].pose);
+        SyncControllerInput(frameState.predictedDisplayTime, guiVisible);
         if (gameFrameSource_)
             gameFrameSource_->PrepareFrame(dayz::stereo_state::RenderedEye());
         static std::uint64_t logCounter{};
@@ -626,8 +1015,6 @@ void OpenXrHost::RenderFrame()
 
         if (guiVisible)
         {
-            if (!guiQuadWasVisible_ || !guiQuadAnchored_)
-                AnchorGuiQuad(views_[0].pose);
             std::uint32_t imageIndex{};
             XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
             if (Check(xrAcquireSwapchainImage(guiSwapchain_.handle, &acquire, &imageIndex),
@@ -672,9 +1059,69 @@ void OpenXrHost::RenderFrame()
     guiLayer.size.width = guiQuadWidthMeters_;
     guiLayer.size.height = guiQuadWidthMeters_ * static_cast<float>(guiSwapchain_.height) /
         static_cast<float>((std::max)(1u, guiSwapchain_.width));
-    std::array<const XrCompositionLayerBaseHeader*, 2> layers{
-        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer), nullptr};
+    std::array<XrCompositionLayerQuad, 6> axisLayers{};
+    std::uint32_t axisLayerCount{};
+    if (frameState.shouldRender && located && controllerAxesEnabled_ &&
+        axisSwapchain_.handle != XR_NULL_HANDLE)
+    {
+        std::uint32_t imageIndex{};
+        XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if (XR_SUCCEEDED(xrAcquireSwapchainImage(axisSwapchain_.handle, &acquire,
+                &imageIndex)))
+        {
+            XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+            wait.timeout = XR_INFINITE_DURATION;
+            if (XR_SUCCEEDED(xrWaitSwapchainImage(axisSwapchain_.handle, &wait)))
+            {
+                const std::uint32_t pixels[3]{0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u};
+                context_->UpdateSubresource(axisSwapchain_.images[imageIndex].texture, 0,
+                    nullptr, pixels, sizeof(pixels), 0);
+            }
+            XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            xrReleaseSwapchainImage(axisSwapchain_.handle, &release);
+        }
+        constexpr float halfLength = 0.04f;
+        constexpr float thickness = 0.006f;
+        const XrVector3f directions[3]{{1.0f, 0.0f, 0.0f},
+            {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
+        constexpr float s = 0.70710678f;
+        const XrQuaternionf axisRotations[3]{{0.0f, 0.0f, 0.0f, 1.0f},
+            {0.0f, 0.0f, s, s}, {0.0f, -s, 0.0f, s}};
+        for (std::size_t hand = 0; hand < gripLocations_.size(); ++hand)
+        {
+            const auto& location = gripLocations_[hand];
+            if ((location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) == 0 ||
+                (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0)
+                continue;
+            for (std::size_t axis = 0; axis < 3; ++axis)
+            {
+                XrCompositionLayerQuad& axisLayer = axisLayers[axisLayerCount++];
+                axisLayer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+                axisLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                axisLayer.space = localSpace_;
+                axisLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                axisLayer.subImage.swapchain = axisSwapchain_.handle;
+                axisLayer.subImage.imageRect.offset = {static_cast<std::int32_t>(axis), 0};
+                axisLayer.subImage.imageRect.extent = {1, 1};
+                const XrVector3f direction = Rotate(location.pose.orientation,
+                    directions[axis]);
+                axisLayer.pose.position = {
+                    location.pose.position.x + direction.x * halfLength,
+                    location.pose.position.y + direction.y * halfLength,
+                    location.pose.position.z + direction.z * halfLength};
+                axisLayer.pose.orientation = Multiply(location.pose.orientation,
+                    axisRotations[axis]);
+                axisLayer.size = {halfLength * 2.0f, thickness};
+            }
+        }
+    }
+    std::array<const XrCompositionLayerBaseHeader*, 8> layers{};
     std::uint32_t layerCount = frameState.shouldRender && located ? 1u : 0u;
+    if (layerCount)
+        layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
+    for (std::uint32_t index = 0; index < axisLayerCount && layerCount < layers.size(); ++index)
+        layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(
+            &axisLayers[index]);
     if (layerCount && guiVisible && guiQuadHasImage_)
         layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&guiLayer);
     XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
@@ -698,6 +1145,7 @@ void OpenXrHost::Tick() noexcept
 void OpenXrHost::Shutdown() noexcept
 {
     std::scoped_lock lock(mutex_);
+    ReleaseControllerKeys();
     gameFrameSource_.reset();
     debugFrameSource_.reset();
     gameSwapChain_.Reset();
@@ -714,6 +1162,19 @@ void OpenXrHost::Shutdown() noexcept
     if (guiSwapchain_.handle != XR_NULL_HANDLE)
         xrDestroySwapchain(guiSwapchain_.handle);
     guiSwapchain_.handle = XR_NULL_HANDLE;
+    axisSwapchain_.images.clear();
+    if (axisSwapchain_.handle != XR_NULL_HANDLE)
+        xrDestroySwapchain(axisSwapchain_.handle);
+    axisSwapchain_.handle = XR_NULL_HANDLE;
+    for (XrSpace& space : aimSpaces_)
+        if (space != XR_NULL_HANDLE) xrDestroySpace(space);
+    for (XrSpace& space : gripSpaces_)
+        if (space != XR_NULL_HANDLE) xrDestroySpace(space);
+    aimSpaces_.fill(XR_NULL_HANDLE);
+    gripSpaces_.fill(XR_NULL_HANDLE);
+    if (actionSet_ != XR_NULL_HANDLE)
+        xrDestroyActionSet(actionSet_);
+    actionSet_ = XR_NULL_HANDLE;
     if (viewSpace_ != XR_NULL_HANDLE) xrDestroySpace(viewSpace_);
     if (localSpace_ != XR_NULL_HANDLE) xrDestroySpace(localSpace_);
     if (session_ != XR_NULL_HANDLE) xrDestroySession(session_);

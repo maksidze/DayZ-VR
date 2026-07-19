@@ -39,15 +39,20 @@ namespace
         std::uintptr_t inventoryPreviewPrepareCallerRva;
         std::uintptr_t dynamicBlurRva;
         std::uintptr_t dynamicBlurParameterIndexRva;
+        std::uintptr_t profileFovRva;
+        std::uintptr_t cameraManagerRva;
+        std::uintptr_t getActiveCameraStateRva;
+        std::uintptr_t cameraFovUpdateRva;
     };
 
     constexpr std::array kBuildProfiles{
         BuildProfile{"DayZ_x64", 0x6A47B9AAu, 0x04407000u, 0x004501A0, 0x004513A0,
             0x004514B0, 0x00952B30, 0x008A2DB0, 0x00351760, 0x0427063C,
-            0x04263740, 0x005C5899, 0x0022FB70, 0x00FEE968},
+            0x04263740, 0x005C5899, 0x0022FB70, 0x00FEE968, 0x01008E70,
+            0x01008D50, 0x004B77D0, 0x004B86C0},
         BuildProfile{"DayZDiag_x64", 0x6A47BAF9u, 0x049E7000u, 0x0048D8A0, 0x0048EB30,
             0x0048EC40, 0x00B30D10, 0x00A7B7B0, 0x00389410, 0x04823F4C,
-            0x04815740, 0, 0, 0},
+            0x04815740, 0, 0, 0, 0, 0, 0, 0},
     };
 
     const BuildProfile* g_buildProfile{};
@@ -63,6 +68,10 @@ namespace
     std::uintptr_t kInventoryPreviewPrepareCallerRva{};
     std::uintptr_t kDynamicBlurRva{};
     std::uintptr_t kDynamicBlurParameterIndexRva{};
+    std::uintptr_t kProfileFovRva{};
+    std::uintptr_t kCameraManagerRva{};
+    std::uintptr_t kGetActiveCameraStateRva{};
+    std::uintptr_t kCameraFovUpdateRva{};
     constexpr std::ptrdiff_t kContextCamera = 0x118;
     constexpr std::ptrdiff_t kPreparedContextCamera = 0xA34;
     constexpr std::ptrdiff_t kContextDescriptor = 0xA10;
@@ -78,6 +87,7 @@ namespace
     using FinalizeViewFn = std::uintptr_t(__fastcall*)(OpaqueEngine*, OpaqueContext*,
         std::uint8_t);
     using ProjectionDispatchFn = std::uintptr_t(__fastcall*)(OpaqueContext*, std::uint8_t);
+    using CameraFovUpdateFn = bool(__fastcall*)(void*);
     using FrameRefreshFn = std::uintptr_t(__fastcall*)(OpaqueCamera*, void*, std::uint8_t);
     using HudLayoutFn = char(__fastcall*)(void*);
     using CameraRefreshFn = float*(__fastcall*)(OpaqueCamera*, void*);
@@ -110,6 +120,7 @@ namespace
     ExecuteViewFn g_executeView{};
     FinalizeViewFn g_finalizeView{};
     ProjectionDispatchFn g_projectionDispatch{};
+    CameraFovUpdateFn g_cameraFovUpdate{};
     FrameRefreshFn g_frameRefresh{};
     HudLayoutFn g_hudLayout{};
     CameraRefreshFn g_cameraRefresh{};
@@ -201,6 +212,8 @@ namespace
     double g_pendingMouseX{};
     double g_pendingMouseY{};
     float g_cameraSeparation{0.064f};
+    float g_hmdPositionScale{1.0f};
+    float g_gameFov{};
     float g_hudScale{0.85f};
     bool g_overrideHudScale{};
     float g_hudSafeWidth{};
@@ -235,8 +248,10 @@ namespace
     bool g_guiQuadEnabled{true};
     bool g_inventoryHmdLookEnabled{true};
     bool g_inventoryBlurEnabled{};
+    bool g_inventoryPlayerPreviewVisible{true};
     float g_inventoryPreviewRotationScale{0.5f};
     std::atomic_bool g_inventoryPreviewActive{};
+    unsigned int g_inventoryPreviewOrdinal{};
     std::mutex g_guiLayerMutex;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> g_guiLayerTexture;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> g_guiLayerTarget;
@@ -328,6 +343,9 @@ float4 PSMain(VertexOutput input) : SV_Target
     Vec3 g_baseTranslation{};
     Vec3 g_lastStereoTranslation{};
     bool g_haveStereoTranslation{};
+    dayz::stereo_state::HmdPosition g_hmdPositionCenter{};
+    bool g_haveHmdPositionCenter{};
+    CameraBasis g_hmdPositionAnchorBasis{};
     std::atomic_uint64_t g_stereoApplyCount{};
     Quaternion g_hmdCenter{0.0f, 0.0f, 0.0f, 1.0f};
     bool g_haveHmdCenter{};
@@ -345,6 +363,81 @@ float4 PSMain(VertexOutput input) : SV_Target
     CameraBasis g_inventoryPreviewLastBasis{};
     bool g_haveInventoryPreviewCenter{};
     bool g_haveInventoryPreviewBasis{};
+    std::atomic_bool g_profileFovLogged{};
+    std::atomic_bool g_activeCameraFovLogged{};
+
+    void LogProfileFovOverride(float original) noexcept
+    {
+        std::ostringstream message;
+        message << "DayZ profile FOV overridden in memory: " << original << " -> "
+            << g_gameFov << " radians; profile file remains unchanged";
+        logging::Info(message.str());
+    }
+
+    void ApplyProfileFovOverride() noexcept
+    {
+        if (!kProfileFovRva || !std::isfinite(g_gameFov) || g_gameFov <= 0.0f)
+            return;
+        float original{};
+        bool applied{};
+        __try
+        {
+            float* value = reinterpret_cast<float*>(g_moduleBase + kProfileFovRva);
+            original = *value;
+            *value = g_gameFov;
+            applied = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            applied = false;
+        }
+        if (applied && !g_profileFovLogged.exchange(true))
+            LogProfileFovOverride(original);
+    }
+
+    void LogActiveCameraFovOverride(float original, float zoomMultiplier) noexcept
+    {
+        std::ostringstream message;
+        message << "DayZ active camera base FOV overridden: " << original << " -> "
+            << g_gameFov << " radians; zoom_multiplier=" << zoomMultiplier;
+        logging::Info(message.str());
+    }
+
+    void ApplyActiveCameraFovOverride() noexcept
+    {
+        if (!kCameraManagerRva || !kGetActiveCameraStateRva ||
+            !std::isfinite(g_gameFov) || g_gameFov <= 0.0f)
+            return;
+        float original{};
+        float zoomMultiplier{};
+        bool applied{};
+        __try
+        {
+            using GetActiveCameraStateFn = std::uintptr_t(__fastcall*)(std::uintptr_t);
+            const auto getActive = reinterpret_cast<GetActiveCameraStateFn>(
+                g_moduleBase + kGetActiveCameraStateRva);
+            const std::uintptr_t state = getActive(g_moduleBase + kCameraManagerRva);
+            if (!state)
+                return;
+            original = *reinterpret_cast<float*>(state + 76);
+            zoomMultiplier = *reinterpret_cast<float*>(state + 80);
+            *reinterpret_cast<float*>(state + 76) = g_gameFov;
+            applied = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            applied = false;
+        }
+        if (applied && !g_activeCameraFovLogged.exchange(true))
+            LogActiveCameraFovOverride(original, zoomMultiplier);
+    }
+
+    bool __fastcall HookedCameraFovUpdate(void* cameraManager)
+    {
+        ApplyProfileFovOverride();
+        ApplyActiveCameraFovOverride();
+        return g_cameraFovUpdate(cameraManager);
+    }
 
     void LogStereoApplication(unsigned eye, float offset)
     {
@@ -561,6 +654,10 @@ float4 PSMain(VertexOutput input) : SV_Target
             g_buildProfile->inventoryPreviewPrepareCallerRva;
         kDynamicBlurRva = g_buildProfile->dynamicBlurRva;
         kDynamicBlurParameterIndexRva = g_buildProfile->dynamicBlurParameterIndexRva;
+        kProfileFovRva = g_buildProfile->profileFovRva;
+        kCameraManagerRva = g_buildProfile->cameraManagerRva;
+        kGetActiveCameraStateRva = g_buildProfile->getActiveCameraStateRva;
+        kCameraFovUpdateRva = g_buildProfile->cameraFovUpdateRva;
 
         static constexpr std::uint8_t prepare[] = {
             0x48,0x85,0xD2,0x0F,0,0,0,0,0,0x48,0x8B,0xC4,0x55,0x56,0x57,0x41,
@@ -635,10 +732,14 @@ float4 PSMain(VertexOutput input) : SV_Target
             return;
         const auto cameraAddress = reinterpret_cast<std::uintptr_t>(camera);
         Vec3 right{};
+        Vec3 up{};
+        Vec3 forward{};
         Vec3 current{};
         __try
         {
             right = *reinterpret_cast<Vec3*>(cameraAddress + 0x08);
+            up = *reinterpret_cast<Vec3*>(cameraAddress + 0x14);
+            forward = *reinterpret_cast<Vec3*>(cameraAddress + 0x20);
             current = *reinterpret_cast<Vec3*>(cameraAddress + 0x2C);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -654,10 +755,40 @@ float4 PSMain(VertexOutput input) : SV_Target
 
         const unsigned eye = dayz::stereo_state::RenderedEye();
         const float offset = (eye == 0 ? -0.5f : 0.5f) * g_cameraSeparation;
+        const auto normalizeAxis = [](const Vec3& axis) {
+            const float length = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+            return length > 0.000001f ? Vec3{axis.x / length, axis.y / length,
+                axis.z / length} : axis;
+        };
+        const Vec3 rightUnit = normalizeAxis(right);
+        const Vec3 upUnit = normalizeAxis(up);
+        const Vec3 forwardUnit = normalizeAxis(forward);
+        Vec3 positionalOffset{};
+        const dayz::stereo_state::HmdPosition hmdPosition =
+            dayz::stereo_state::GetHmdPosition();
+        if (hmdPosition.valid)
+        {
+            if (!g_haveHmdPositionCenter)
+            {
+                g_hmdPositionCenter = hmdPosition;
+                g_hmdPositionAnchorBasis = {right, up, forward};
+                g_haveHmdPositionCenter = true;
+            }
+            const float dx = (hmdPosition.x - g_hmdPositionCenter.x) * g_hmdPositionScale;
+            const float dy = (hmdPosition.y - g_hmdPositionCenter.y) * g_hmdPositionScale;
+            const float dz = (hmdPosition.z - g_hmdPositionCenter.z) * g_hmdPositionScale;
+            const Vec3 anchorRight = normalizeAxis(g_hmdPositionAnchorBasis.right);
+            const Vec3 anchorUp = normalizeAxis(g_hmdPositionAnchorBasis.up);
+            const Vec3 anchorForward = normalizeAxis(g_hmdPositionAnchorBasis.forward);
+            positionalOffset = {
+                anchorRight.x * dx + anchorUp.x * dy - anchorForward.x * dz,
+                anchorRight.y * dx + anchorUp.y * dy - anchorForward.y * dz,
+                anchorRight.z * dx + anchorUp.z * dy - anchorForward.z * dz};
+        }
         const Vec3 translated{
-            g_baseTranslation.x + right.x * offset,
-            g_baseTranslation.y + right.y * offset,
-            g_baseTranslation.z + right.z * offset};
+            g_baseTranslation.x + right.x * offset + positionalOffset.x,
+            g_baseTranslation.y + right.y * offset + positionalOffset.y,
+            g_baseTranslation.z + right.z * offset + positionalOffset.z};
         __try
         {
             *reinterpret_cast<Vec3*>(cameraAddress + 0x2C) = translated;
@@ -850,6 +981,7 @@ float4 PSMain(VertexOutput input) : SV_Target
     void ResetInventoryPreviewAnchor() noexcept
     {
         g_inventoryPreviewActive.store(false, std::memory_order_relaxed);
+        g_inventoryPreviewOrdinal = 0;
         g_inventoryPreviewCamera = nullptr;
         g_haveInventoryPreviewCenter = false;
         g_haveInventoryPreviewBasis = false;
@@ -875,7 +1007,7 @@ float4 PSMain(VertexOutput input) : SV_Target
             -g_inventoryPreviewHmdCenter.y, -g_inventoryPreviewHmdCenter.z,
             g_inventoryPreviewHmdCenter.w};
         const Quaternion relative = Normalize(Multiply(inverseCenter, current));
-        const float rotationScale = (std::clamp)(g_inventoryPreviewRotationScale, 0.0f,
+        const float rotationScale = (std::clamp)(g_inventoryPreviewRotationScale, -2.0f,
             2.0f);
         const Quaternion scaledRelative = Normalize({relative.x * rotationScale,
             relative.y * rotationScale, relative.z * rotationScale,
@@ -928,15 +1060,34 @@ float4 PSMain(VertexOutput input) : SV_Target
         g_haveInventoryPreviewBasis = true;
     }
 
+    void HideInventoryPlayerPreview(OpaqueCamera* camera) noexcept
+    {
+        if (!camera)
+            return;
+        const auto address = reinterpret_cast<std::uintptr_t>(camera);
+        __try
+        {
+            Vec3 position = *reinterpret_cast<Vec3*>(address + 0x2C);
+            position.y += 1000000.0f;
+            *reinterpret_cast<Vec3*>(address + 0x2C) = position;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
     std::uintptr_t __fastcall HookedFrameRefresh(OpaqueCamera* camera, void* engine,
         std::uint8_t rebuild)
     {
         // This is deliberately done before DayZ derives any view, inverse-view,
         // culling or view-projection matrices. Applying it in the virtual basis
         // getter is too late: several consumers have already cached the old pose.
-        if (g_projectionRefreshDepth != 0 && camera == g_projectionContextCamera)
+        const bool primaryProjectionCamera = g_projectionRefreshDepth != 0 &&
+            camera == g_projectionContextCamera;
+        if (primaryProjectionCamera)
             ApplyHmdRotationToCamera(camera);
-        return g_frameRefresh(camera, engine, rebuild);
+        const std::uintptr_t result = g_frameRefresh(camera, engine, rebuild);
+        return result;
     }
 
     float* __fastcall HookedCameraRefresh(OpaqueCamera* camera, void* output)
@@ -1040,7 +1191,17 @@ float4 PSMain(VertexOutput input) : SV_Target
             callerRva == kInventoryPreviewPrepareCallerRva && IsGuiCursorModeActive())
         {
             g_inventoryPreviewActive.store(true, std::memory_order_relaxed);
-            ApplyInventoryPreviewRotation(camera);
+            // DayZ submits three auxiliary inventory views in a stable order.
+            // The first and largest one is the character preview. Later views
+            // are item previews already captured into the world-locked GUI and
+            // must not receive an additional camera compensation.
+            if (g_inventoryPreviewOrdinal++ == 0)
+            {
+                if (g_inventoryPlayerPreviewVisible)
+                    ApplyInventoryPreviewRotation(camera);
+                else
+                    HideInventoryPlayerPreview(camera);
+            }
         }
         Record(EventKind::Prepare, context, mode, camera);
         g_prepareView(engine, context, mode, camera);
@@ -1062,6 +1223,8 @@ float4 PSMain(VertexOutput input) : SV_Target
 
     std::uintptr_t __fastcall HookedProjectionDispatch(OpaqueContext* context, std::uint8_t mode)
     {
+        ApplyProfileFovOverride();
+        ApplyActiveCameraFovOverride();
         EnsureCameraRefreshHook(context);
         ApplyAlternateEye(context);
         Record(EventKind::Projection, context, mode);
@@ -2332,6 +2495,10 @@ namespace dayz::runtime_probe
         g_hmdMouseYawScale = ReadFloat(L"stereo", L"hmd_mouse_yaw_scale", -600.0f);
         g_hmdMousePitchScale = ReadFloat(L"stereo", L"hmd_mouse_pitch_scale", -600.0f);
         g_cameraSeparation = ReadFloat(L"stereo", L"camera_separation", 0.064f);
+        g_hmdPositionScale = ReadFloat(L"stereo", L"hmd_position_scale", 1.0f);
+        g_gameFov = (std::clamp)(ReadFloat(L"stereo", L"game_fov", 0.0f), 0.0f, 2.8f);
+        ApplyProfileFovOverride();
+        ApplyActiveCameraFovOverride();
         g_hudScale = ReadFloat(L"stereo", L"hud_scale", 0.85f);
         g_overrideHudScale = ReadBoolean(L"stereo", L"override_hud_scale", false);
         g_hudSafeWidth = ReadFloat(L"stereo", L"hud_safe_width", 0.0f);
@@ -2346,6 +2513,8 @@ namespace dayz::runtime_probe
         g_guiQuadEnabled = ReadBoolean(L"gui", L"quad_enabled", true);
         g_inventoryHmdLookEnabled = ReadBoolean(L"gui", L"inventory_hmd_look", true);
         g_inventoryBlurEnabled = ReadBoolean(L"gui", L"inventory_blur_enabled", false);
+        g_inventoryPlayerPreviewVisible = ReadBoolean(L"gui",
+            L"inventory_player_preview_visible", true);
         g_inventoryPreviewRotationScale = ReadFloat(L"gui",
             L"inventory_preview_rotation_scale", 0.5f);
         const float imageShift = ReadFloat(L"stereo", L"image_shift", 0.0f);
@@ -2395,6 +2564,14 @@ namespace dayz::runtime_probe
             if (!dynamicBlurHookCreated)
                 logging::Error("Inventory blur hook creation failed; blur remains enabled");
         }
+        bool cameraFovHookCreated{};
+        if (g_gameFov > 0.0f && kCameraFovUpdateRva)
+        {
+            cameraFovHookCreated = AddHook(kCameraFovUpdateRva, HookedCameraFovUpdate,
+                g_cameraFovUpdate);
+            if (!cameraFovHookCreated)
+                logging::Error("Gameplay camera FOV hook creation failed");
+        }
         const std::array<void*, 6> targets{
             reinterpret_cast<void*>(g_moduleBase + kPrepareViewRva),
             reinterpret_cast<void*>(g_moduleBase + kExecuteViewRva),
@@ -2418,6 +2595,15 @@ namespace dayz::runtime_probe
                 logging::Info("Inventory Gauss blur disabled by [gui] setting");
             else
                 logging::Error("Inventory blur hook could not be enabled; blur remains enabled");
+        }
+        if (cameraFovHookCreated)
+        {
+            const MH_STATUS enabled = MH_EnableHook(
+                reinterpret_cast<void*>(g_moduleBase + kCameraFovUpdateRva));
+            if (enabled == MH_OK || enabled == MH_ERROR_ENABLED)
+                logging::Info("Gameplay camera FOV override hook active");
+            else
+                logging::Error("Gameplay camera FOV override hook could not be enabled");
         }
         if (frameRefreshHookCreated)
         {
@@ -2460,6 +2646,7 @@ namespace dayz::runtime_probe
                 << g_cameraSeparation << " image_shift=" << imageShift
                 << " hmd_rotation=" << g_hmdRotationEnabled
                 << " hmd_native_aim=" << g_hmdNativeAimEnabled
+                << " game_fov=" << g_gameFov
                 << " hmd_mouse_scale=" << g_hmdMouseYawScale << ','
                 << g_hmdMousePitchScale
                 << " fit_mode=" << fitModeName
@@ -2500,9 +2687,13 @@ namespace dayz::runtime_probe
     {
         if (!g_active.load(std::memory_order_relaxed))
             return;
+        ApplyProfileFovOverride();
+        ApplyActiveCameraFovOverride();
         UpdateNativeHmdAim();
         if (!IsGuiCursorModeActive())
             ResetInventoryPreviewAnchor();
+        else
+            g_inventoryPreviewOrdinal = 0;
         const std::uint64_t frame = g_presentCount.fetch_add(1) + 1;
         if (g_overrideHudScale)
             WriteHudScale();
@@ -2579,6 +2770,21 @@ namespace dayz::runtime_probe
     {
         return g_active.load(std::memory_order_relaxed) && g_guiQuadEnabled &&
             IsGuiCursorModeActive() && g_guiLayerView;
+    }
+
+    void SetGuiVirtualCursorNormalized(float u, float v) noexcept
+    {
+        const auto width = g_guiNativeWidth.load(std::memory_order_relaxed);
+        const auto height = g_guiNativeHeight.load(std::memory_order_relaxed);
+        if (!width || !height)
+            return;
+        u = (std::clamp)(u, 0.0f, 1.0f);
+        v = (std::clamp)(v, 0.0f, 1.0f);
+        g_guiVirtualCursorX.store(static_cast<LONG>(std::lround(u * (width - 1))),
+            std::memory_order_relaxed);
+        g_guiVirtualCursorY.store(static_cast<LONG>(std::lround(v * (height - 1))),
+            std::memory_order_relaxed);
+        g_guiVirtualCursorActive.store(true, std::memory_order_release);
     }
 
     bool RenderGuiQuad(ID3D11RenderTargetView* target, std::uint32_t width,

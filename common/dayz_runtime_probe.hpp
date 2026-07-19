@@ -16,6 +16,7 @@ namespace dayz::runtime_probe
     void BeforePresent(IDXGISwapChain* swapChain) noexcept;
     void OnPresent() noexcept;
     bool IsGuiQuadVisible() noexcept;
+    void SetGuiVirtualCursorNormalized(float u, float v) noexcept;
     bool RenderGuiQuad(ID3D11RenderTargetView* target, std::uint32_t width,
         std::uint32_t height) noexcept;
     bool IsActive() noexcept;

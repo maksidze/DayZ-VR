@@ -52,6 +52,12 @@ private:
         std::vector<Microsoft::WRL::ComPtr<ID3D11RenderTargetView>> rtvs;
     };
 
+    struct AxisSwapchain
+    {
+        XrSwapchain handle{XR_NULL_HANDLE};
+        std::vector<XrSwapchainImageD3D11KHR> images;
+    };
+
     bool CreateInstanceAndSystem();
     bool CreateCompatibleDevice();
     bool ValidateDevice(ID3D11Device* device);
@@ -60,6 +66,10 @@ private:
     bool CreateSpaces();
     bool CreateSwapchains();
     bool CreateGuiSwapchain(const std::vector<std::int64_t>& formats);
+    bool CreateControllerActions();
+    bool CreateAxisSwapchain(const std::vector<std::int64_t>& formats);
+    void SyncControllerInput(XrTime displayTime, bool guiVisible);
+    void ReleaseControllerKeys() noexcept;
     void PollEvents();
     void RenderFrame();
     void AnchorGuiQuad(const XrPosef& headPose) noexcept;
@@ -80,6 +90,21 @@ private:
     std::unique_ptr<IFrameSource> gameFrameSource_;
     std::array<EyeSwapchain, 2> eyeSwapchains_{};
     GuiSwapchain guiSwapchain_{};
+    AxisSwapchain axisSwapchain_{};
+    XrActionSet actionSet_{XR_NULL_HANDLE};
+    XrAction gripPoseAction_{XR_NULL_HANDLE};
+    XrAction aimPoseAction_{XR_NULL_HANDLE};
+    XrAction triggerAction_{XR_NULL_HANDLE};
+    XrAction xButtonAction_{XR_NULL_HANDLE};
+    XrAction yButtonAction_{XR_NULL_HANDLE};
+    XrAction thumbstickAction_{XR_NULL_HANDLE};
+    std::array<XrPath, 2> handPaths_{{XR_NULL_PATH, XR_NULL_PATH}};
+    std::array<XrSpace, 2> gripSpaces_{{XR_NULL_HANDLE, XR_NULL_HANDLE}};
+    std::array<XrSpace, 2> aimSpaces_{{XR_NULL_HANDLE, XR_NULL_HANDLE}};
+    std::array<XrSpaceLocation, 2> gripLocations_{{
+        {XR_TYPE_SPACE_LOCATION}, {XR_TYPE_SPACE_LOCATION}}};
+    std::array<XrSpaceLocation, 2> aimLocations_{{
+        {XR_TYPE_SPACE_LOCATION}, {XR_TYPE_SPACE_LOCATION}}};
     std::array<XrView, 2> views_{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
     XrPosef guiQuadPose_{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.25f}};
     float guiQuadWidthMeters_{1.4f};
@@ -89,6 +114,14 @@ private:
     bool guiQuadAnchored_{};
     bool guiQuadWasVisible_{};
     bool guiQuadHasImage_{};
+    bool controllerInputEnabled_{true};
+    bool controllerAxesEnabled_{true};
+    float controllerTurnScale_{18.0f};
+    float controllerDeadzone_{0.3f};
+    std::array<bool, 4> movementKeys_{};
+    bool triggerDown_{};
+    bool xButtonDown_{};
+    bool yButtonDown_{};
     bool initialized_{};
     bool sessionRunning_{};
     bool shouldExit_{};
